@@ -1,24 +1,22 @@
-"""State-machine orchestrator.
+"""状态机编排层。
 
-The Workflow drives one Agent session through the loop
+Workflow 驱动一个 Agent session 走完下面这个循环：
 
     IDLE -> THINKING -> ACTING -> OBSERVING -> REFLECTING -> ...
 
-and finally lands in ``DONE`` or ``FAILED``. It glues together every
-other layer in the codebase:
+最终落到 ``DONE`` 或 ``FAILED``。它把代码库里的所有其它层串到一起：
 
-* ``LLMClient``        -> generates assistant turns
-* ``SessionContext``   -> remembers the conversation so far
-* ``parse_response``   -> structures the assistant turn
-* ``ToolRegistry``     -> dispatches tool calls
-* ``Executor``         -> sandbox for code / scripts (via tools)
-* ``TraceLogger``      -> records every state change
-* ``SystemPromptBuilder`` -> seeds the System message per (role, mode)
+* ``LLMClient``           -> 产出 assistant 一轮回复
+* ``SessionContext``      -> 记住目前为止的对话
+* ``parse_response``      -> 把 assistant 回复结构化
+* ``ToolRegistry``        -> 分发工具调用
+* ``Executor``            -> 通过工具间接驱动代码 / 脚本沙箱
+* ``TraceLogger``         -> 记录每一次状态切换
+* ``SystemPromptBuilder`` -> 按 (role, mode) 注入 System 消息
 
-Conflict detection and the reflection step both honour the spec's
-distinction: any :class:`RetryableError` re-enters THINKING with the
-error appended as feedback; any :class:`FatalError` short-circuits to
-FAILED with the trace flushed first.
+冲突检测与反思阶段都遵循规范中的分工：任何 :class:`RetryableError` 都会回到
+THINKING 并把错误作为反馈附加进上下文；任何 :class:`FatalError` 都会直接把
+状态切到 FAILED 并先把轨迹刷盘。
 """
 
 from __future__ import annotations
@@ -65,14 +63,20 @@ from utils.parser import parse_response
 logger = logging.getLogger(__name__)
 
 
-# Sentinel substrings the assistant may emit to declare "I'm done".
-# Kept conservative — workflow termination is also driven by max_turns
-# and the Reflector's structured decision.
-_DONE_MARKERS = ("[done]", "<done/>", "<done></done>")
+# Assistant 可以输出的"我已经做完了"哨兵子串。
+# 同时接受中英文标记，让同一套 workflow 既能驱动中文模型也能驱动英文模型。
+_DONE_MARKERS = (
+    "[done]",
+    "<done/>",
+    "<done></done>",
+    "[完成]",
+    "<完成/>",
+    "<完成></完成>",
+)
 
 
 # --------------------------------------------------------------------------- #
-# Config
+# 配置
 # --------------------------------------------------------------------------- #
 
 @dataclass(frozen=True)
@@ -112,7 +116,7 @@ class Workflow:
         self._state = AgentState.IDLE
         self._turn = 0
 
-    # ------------------- public API ------------------- #
+    # ------------------- 公共 API ------------------- #
 
     @property
     def state(self) -> AgentState:
@@ -123,7 +127,7 @@ class Workflow:
         return self._turn
 
     def run(self, user_prompt: str) -> WorkflowResult:
-        """Execute the loop until termination. Returns a :class:`WorkflowResult`."""
+        """跑完整个循环直到终止，返回 :class:`WorkflowResult`。"""
         try:
             self._seed_context(user_prompt)
         except FatalError as exc:
@@ -132,7 +136,7 @@ class Workflow:
         while True:
             if self._turn >= self._config.max_turns:
                 return self._finalize_failed(
-                    f"max_turns={self._config.max_turns} reached without DONE",
+                    f"已达到 max_turns={self._config.max_turns} 但仍未结束",
                 )
 
             self._turn += 1
@@ -153,14 +157,14 @@ class Workflow:
                 continue
             except FatalError as exc:
                 return self._finalize_failed(str(exc))
-            except Exception as exc:  # noqa: BLE001 -- ensure we never crash the session silently
-                logger.exception("workflow unexpected error")
+            except Exception as exc:  # noqa: BLE001 -- 保证 session 不会无声崩溃
+                logger.exception("workflow 发生未预期错误")
                 return self._finalize_failed(f"{type(exc).__name__}: {exc}")
 
-    # ------------------- state-machine steps ------------------- #
+    # ------------------- 状态机各阶段 ------------------- #
 
     def _seed_context(self, user_prompt: str) -> None:
-        # Only seed if the caller hasn't already loaded a System prompt.
+        # 仅当调用方还没有装载过 System prompt 时才注入。
         if not any(m.role is MessageRole.SYSTEM for m in self._context.messages()):
             system = SystemPromptBuilder(
                 role=self._config.role,
@@ -191,9 +195,8 @@ class Workflow:
         return reply
 
     def _parse_reply(self, reply: str) -> ParsedOutput:
-        # Be permissive at the top level: an assistant turn might be pure
-        # narrative ("I'll now plan...") without any structured block.
-        # The parser still enforces PHILOSOPHY-mode <thought> presence.
+        # 顶层保持宽容：assistant 这一轮可能纯粹是叙述（"我先来规划一下..."），
+        # 没有任何结构化块。parser 仍会强制 PHILOSOPHY 模式必须出现 <thought>。
         try:
             return parse_response(reply, mode=self._mode, require_block=False)
         except CodeFormatError:
@@ -236,19 +239,19 @@ class Workflow:
             )
             self._context.add(tool_message)
 
-        # If any tool failed, surface it as a conflict so REFLECTING runs.
+        # 任何工具失败时记录一条日志，REFLECTING 阶段会把它当成冲突处理。
         for result in results:
             if result.status is ToolStatus.FAILED:
-                logger.info("tool %s failed; will reflect", result.name)
+                logger.info("工具 %s 失败，将进入反思阶段", result.name)
         return True
 
     def _reflect(self, parsed: ParsedOutput, acted: bool) -> None:
         self._transition(AgentState.REFLECTING)
 
-        # Look for a Reflection-shaped JSON block from the assistant; if
-        # present, use its `next_action`. Otherwise, default behaviour:
-        #   - acted=True  -> keep looping
-        #   - acted=False -> keep looping (LLM may still need turns)
+        # 在 assistant 输出里找符合 Reflection 形状的 JSON 块；如果有，
+        # 按 `next_action` 决定流向。否则默认行为：
+        #   - acted=True  -> 继续下一轮
+        #   - acted=False -> 继续下一轮（LLM 可能还需要更多轮次）
         decision = None
         for block in parsed.json_blocks:
             if "next_action" in block:
@@ -265,18 +268,18 @@ class Workflow:
             self._context.add(
                 ChatMessage(
                     role=MessageRole.SYSTEM,
-                    content="[reflector] Plan revision requested; reconsider strategy.",
+                    content="[反思器] 已请求修订计划；请重新评估策略后再继续。",
                 )
             )
             return
         if decision == "retry":
-            # Same plan, next turn.
+            # 保持当前计划，进入下一轮。
             return
 
-        # No explicit reflector decision; continue without state change.
+        # 未显式给出反思决定时，不改变状态，正常继续循环。
         return
 
-    # ------------------- error handling ------------------- #
+    # ------------------- 错误处理 ------------------- #
 
     def _handle_retryable(self, exc: TinyDevinError) -> None:
         kind = type(exc).__name__
@@ -294,19 +297,19 @@ class Workflow:
         details = getattr(exc, "details", None)
         if isinstance(exc, EvidenceConflict):
             return (
-                f"[feedback] Conflict detected: {exc}. "
-                "Reconsider the previous claim using the new evidence."
+                f"[反馈] 检测到冲突：{exc}。"
+                "请基于新证据，重新审视先前的主张并调整下一步行动。"
             )
         if isinstance(exc, CodeFormatError):
             return (
-                f"[feedback] Your last response could not be parsed ({exc}). "
-                "Please re-emit your answer using the structured tags described "
-                "in the system prompt."
+                f"[反馈] 你上一轮的响应无法被解析（{exc}）。"
+                "请严格按照系统提示中规定的结构化标签格式（<file> / "
+                "<thought> / <tool> / ```json``` 代码块）重新作答。"
             )
-        suffix = f" details={details}" if details else ""
-        return f"[feedback] retryable failure ({kind}): {exc}.{suffix}"
+        suffix = f" 细节：{details}" if details else ""
+        return f"[反馈] 可重试失败（{kind}）：{exc}。{suffix}"
 
-    # ------------------- termination ------------------- #
+    # ------------------- 终止处理 ------------------- #
 
     def _is_terminal_reply(self, reply: str, parsed: ParsedOutput) -> bool:
         lowered = reply.lower()
@@ -335,7 +338,7 @@ class Workflow:
             error=error,
         )
 
-    # ------------------- helpers ------------------- #
+    # ------------------- 辅助函数 ------------------- #
 
     def _transition(self, new_state: AgentState) -> None:
         if new_state is self._state:
@@ -351,24 +354,24 @@ class Workflow:
 
 
 # --------------------------------------------------------------------------- #
-# Small helpers
+# 小工具
 # --------------------------------------------------------------------------- #
 
 def _safe_truncate(value, limit: int = 2000):
-    """Trim oversized payloads before persisting to the audit log."""
+    """把过大的载荷截断后再写入审计日志。"""
     try:
         text = repr(value)
     except Exception:  # noqa: BLE001
-        return "<unrepr-able>"
+        return "<repr 失败>"
     if len(text) <= limit:
         return value
-    return text[:limit] + f" ...[truncated {len(text) - limit} chars]"
+    return text[:limit] + f" ...[已截断 {len(text) - limit} 个字符]"
 
 
 def _format_tool_result_for_llm(result) -> str:
     if result.status is ToolStatus.SUCCESS:
-        return f"[tool {result.name} OK]\n{result.output}"
-    return f"[tool {result.name} FAILED]\n{result.error}"
+        return f"[工具 {result.name} 成功]\n{result.output}"
+    return f"[工具 {result.name} 失败]\n{result.error}"
 
 
 __all__ = ["Workflow", "WorkflowConfig"]

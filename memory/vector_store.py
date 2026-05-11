@@ -1,12 +1,11 @@
-"""Long-term experience memory backed by ChromaDB.
+"""基于 ChromaDB 的长期经验记忆。
 
-The wrapper hides ChromaDB's heavy import behind a *lazy* call: the
-client is constructed only on first use, so importing this module is
-cheap even when no vector query is ever issued.
+包装器把 ChromaDB 的重量级 import 藏在 *懒加载* 调用后面：客户端只在第一次
+使用时才被构造，因此即使一整个 session 从不发起向量查询，import 本模块的
+代价也接近零。
 
-The store is **mode-agnostic**: collections can hold whatever the Agent
-deems memorable — code snippets, failed unit tests, philosophical
-counter-arguments, citations.
+存储是 **任务模式无关** 的：collection 里可以放任何 Agent 觉得值得记住的东西
+—— 代码片段、失败的单元测试、哲学反例、引文。
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Config & data classes
+# 配置与数据类
 # --------------------------------------------------------------------------- #
 
 @dataclass(frozen=True)
@@ -53,10 +52,10 @@ class VectorHit(BaseModel):
 # --------------------------------------------------------------------------- #
 
 class VectorStore:
-    """Thin ChromaDB wrapper with idempotent upserts and similarity queries.
+    """ChromaDB 的薄包装，提供幂等 upsert 与相似度检索。
 
-    Heavy imports (chromadb + embedding model) are deferred to the first
-    call, which lets callers instantiate :class:`VectorStore` cheaply.
+    重量级 import（chromadb + 嵌入模型）被延迟到第一次调用时执行，所以创建
+    :class:`VectorStore` 本身是廉价的。
     """
 
     def __init__(self, config: Optional[VectorStoreConfig] = None) -> None:
@@ -68,7 +67,7 @@ class VectorStore:
     def config(self) -> VectorStoreConfig:
         return self._config
 
-    # ------------------- public API ------------------- #
+    # ------------------- 公共 API ------------------- #
 
     def upsert(
         self,
@@ -79,11 +78,11 @@ class VectorStore:
         if not texts:
             return []
         if metadatas is not None and len(metadatas) != len(texts):
-            raise ValueError("metadatas length must match texts length")
+            raise ValueError("metadatas 长度必须与 texts 一致")
         if ids is None:
             ids = [f"mem-{uuid.uuid4().hex[:12]}" for _ in texts]
         elif len(ids) != len(texts):
-            raise ValueError("ids length must match texts length")
+            raise ValueError("ids 长度必须与 texts 一致")
 
         try:
             collection = self._get_collection()
@@ -92,9 +91,9 @@ class VectorStore:
                 metadatas=list(metadatas) if metadatas else None,
                 ids=ids,
             )
-        except Exception as exc:  # noqa: BLE001 -- normalise into our exception
+        except Exception as exc:  # noqa: BLE001 -- 规范化成项目自己的异常
             raise TinyDevinMemoryError(
-                "vector store upsert failed",
+                "向量库 upsert 失败",
                 details={"error": str(exc), "count": len(texts)},
             ) from exc
         return list(ids)
@@ -107,7 +106,7 @@ class VectorStore:
             result = collection.query(query_texts=[text], n_results=k)
         except Exception as exc:  # noqa: BLE001
             raise TinyDevinMemoryError(
-                "vector store query failed",
+                "向量库查询失败",
                 details={"error": str(exc), "k": k},
             ) from exc
 
@@ -136,7 +135,7 @@ class VectorStore:
             collection.delete(ids=list(ids))
         except Exception as exc:  # noqa: BLE001
             raise TinyDevinMemoryError(
-                "vector store delete failed",
+                "向量库 delete 失败",
                 details={"error": str(exc), "count": len(ids)},
             ) from exc
 
@@ -145,15 +144,15 @@ class VectorStore:
             collection = self._get_collection()
             return int(collection.count())
         except Exception as exc:  # noqa: BLE001
-            raise TinyDevinMemoryError("vector store count failed") from exc
+            raise TinyDevinMemoryError("向量库 count 失败") from exc
 
     def close(self) -> None:
-        # ChromaDB persistent client has no explicit close; drop refs so GC
-        # can release file handles.
+        # ChromaDB 的 PersistentClient 没有显式 close；把引用释放掉让 GC
+        # 自己回收文件句柄。
         self._collection = None
         self._client = None
 
-    # ------------------- internals ------------------- #
+    # ------------------- 内部实现 ------------------- #
 
     def _get_collection(self):
         if self._collection is not None:
@@ -161,9 +160,9 @@ class VectorStore:
 
         try:
             import chromadb  # type: ignore
-        except ImportError as exc:  # pragma: no cover - dependency error
+        except ImportError as exc:  # pragma: no cover - 依赖错误
             raise TinyDevinMemoryError(
-                "chromadb is not installed; install it via requirements.txt",
+                "chromadb 未安装；请通过 requirements.txt 安装",
             ) from exc
 
         os.makedirs(self._config.persist_dir, exist_ok=True)
@@ -175,7 +174,7 @@ class VectorStore:
             )
         except Exception as exc:  # noqa: BLE001
             raise TinyDevinMemoryError(
-                "failed to open chromadb persistent client",
+                "无法打开 chromadb PersistentClient",
                 details={"error": str(exc), "persist_dir": self._config.persist_dir},
             ) from exc
 

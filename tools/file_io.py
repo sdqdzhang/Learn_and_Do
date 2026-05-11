@@ -1,8 +1,8 @@
-"""File I/O tools confined to the workspace directory.
+"""文件 IO 工具，所有读写都被限制在工作空间目录内。
 
-All three tools (read / write / list) refuse any path that escapes
-``WORKSPACE_DIR``. This is the *Agent-facing* file API; the Executor has
-its own host-side path handling and is independent of these tools.
+读 / 写 / 列表三个工具都会拒绝任何越过 ``WORKSPACE_DIR`` 的路径。这一组
+是 *Agent 视角* 的文件 API；Executor 自己另有一套宿主机侧的路径处理，
+与这里的工具是独立的两层防御。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ def _workspace_root() -> Path:
 
 
 def _resolve_safe(rel_path: str) -> Path:
-    """Resolve ``rel_path`` against the workspace, blocking escapes."""
+    """把 ``rel_path`` 相对工作空间做路径拼接，并拒绝越权访问。"""
     root = _workspace_root()
     root.mkdir(parents=True, exist_ok=True)
     candidate = (root / rel_path).resolve()
@@ -30,27 +30,27 @@ def _resolve_safe(rel_path: str) -> Path:
         candidate.relative_to(root)
     except ValueError as exc:
         raise SandboxViolation(
-            f"path escapes workspace: {rel_path!r}",
+            f"路径越权访问工作空间之外：{rel_path!r}",
             details={"resolved": str(candidate)},
         ) from exc
     return candidate
 
 
 # --------------------------------------------------------------------------- #
-# Tools
+# 工具
 # --------------------------------------------------------------------------- #
 
 class FileReadTool(Tool):
     spec = ToolSpec(
         name="file_read",
-        description="Read a UTF-8 text file from the workspace and return its contents.",
+        description="从工作空间读取一个 UTF-8 文本文件，返回其内容。",
         args_schema={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Workspace-relative path"},
+                "path": {"type": "string", "description": "工作空间内的相对路径"},
                 "max_bytes": {
                     "type": "integer",
-                    "description": "Optional cap; oversized files are truncated.",
+                    "description": "可选字节上限；超过则截断。",
                 },
             },
             "required": ["path"],
@@ -60,15 +60,15 @@ class FileReadTool(Tool):
     def call(self, args: Dict[str, Any]) -> Dict[str, Any]:
         target = _resolve_safe(args["path"])
         if not target.exists():
-            raise ToolError(f"file not found: {args['path']}")
+            raise ToolError(f"文件不存在：{args['path']}")
         if not target.is_file():
-            raise ToolError(f"not a regular file: {args['path']}")
+            raise ToolError(f"目标不是常规文件：{args['path']}")
 
         max_bytes: Optional[int] = args.get("max_bytes")
         try:
             raw = target.read_bytes()
         except OSError as exc:
-            raise ToolError(f"read failed: {exc}") from exc
+            raise ToolError(f"读取失败：{exc}") from exc
 
         truncated = False
         if max_bytes is not None and len(raw) > max_bytes:
@@ -78,7 +78,7 @@ class FileReadTool(Tool):
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise ToolError(f"file is not valid UTF-8: {exc}") from exc
+            raise ToolError(f"文件不是有效的 UTF-8 编码：{exc}") from exc
 
         return {
             "path": args["path"],
@@ -92,14 +92,14 @@ class FileWriteTool(Tool):
     spec = ToolSpec(
         name="file_write",
         description=(
-            "Create or overwrite a UTF-8 text file inside the workspace. "
-            "Parent directories are created as needed."
+            "在工作空间内创建或覆盖一个 UTF-8 文本文件，"
+            "必要时会自动创建父目录。"
         ),
         args_schema={
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "content": {"type": "string"},
+                "path": {"type": "string", "description": "工作空间内的相对路径"},
+                "content": {"type": "string", "description": "要写入的完整文本"},
             },
             "required": ["path", "content"],
         },
@@ -111,20 +111,20 @@ class FileWriteTool(Tool):
         try:
             target.write_text(args["content"], encoding="utf-8")
         except OSError as exc:
-            raise ToolError(f"write failed: {exc}") from exc
+            raise ToolError(f"写入失败：{exc}") from exc
         return {"path": args["path"], "bytes_written": target.stat().st_size}
 
 
 class FileListTool(Tool):
     spec = ToolSpec(
         name="file_list",
-        description="List files and directories inside a workspace folder (one level deep).",
+        description="列出工作空间内某个目录下的文件与子目录（仅一层深度）。",
         args_schema={
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative directory; defaults to root.",
+                    "description": "工作空间内的相对目录；留空则视为根目录。",
                 },
             },
         },
@@ -136,7 +136,7 @@ class FileListTool(Tool):
         if not target.exists():
             return {"path": rel, "entries": []}
         if not target.is_dir():
-            raise ToolError(f"not a directory: {rel}")
+            raise ToolError(f"目标不是目录：{rel}")
 
         entries: List[Dict[str, Any]] = []
         for child in sorted(target.iterdir()):

@@ -1,9 +1,8 @@
-"""Web search tool.
+"""网页搜索工具。
 
-Implements a *minimal*, key-less search via the DuckDuckGo HTML
-endpoint. This is intentionally conservative: it works without API
-credentials, gracefully degrades when offline, and is easy to swap for
-a paid backend later by overriding :meth:`WebSearchTool.fetch_html`.
+实现一个 *最小化* 的、无需 API key 的搜索后端 —— 走 DuckDuckGo 的 HTML
+端点。这样设计是有意为之：无需密钥就能跑、离线状态下能优雅失败、未来想
+切换到付费后端只需重写 :meth:`WebSearchTool.fetch_html` 即可。
 """
 
 from __future__ import annotations
@@ -24,14 +23,17 @@ class WebSearchTool(Tool):
     spec = ToolSpec(
         name="web_search",
         description=(
-            "Search the public web for a query and return the top results. "
-            "Each result has 'title', 'url' and 'snippet'."
+            "在公开网络上检索一段查询，返回前 k 条结果。"
+            "每条结果包含 title / url / snippet 三个字段。"
         ),
         args_schema={
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
-                "k": {"type": "integer", "description": "Max results (default 5, capped at 20)."},
+                "query": {"type": "string", "description": "要搜索的查询文本"},
+                "k": {
+                    "type": "integer",
+                    "description": "最多返回多少条结果（默认 5，上限 20）。",
+                },
             },
             "required": ["query"],
         },
@@ -45,21 +47,21 @@ class WebSearchTool(Tool):
     def call(self, args: Dict[str, Any]) -> Dict[str, Any]:
         query = args["query"].strip()
         if not query:
-            raise ToolError("query is empty")
+            raise ToolError("query 不能为空")
         k = max(1, min(int(args.get("k", 5)), 20))
 
         html_text = self.fetch_html(query)
         results = _parse_duckduckgo_html(html_text, limit=k)
         return {"query": query, "results": results}
 
-    # ------------------- Override-friendly seam ------------------- #
+    # ------------------- 可被子类覆盖的切口 ------------------- #
 
     def fetch_html(self, query: str) -> str:
-        """Perform the HTTP request; raise :class:`ToolError` on any failure."""
+        """执行 HTTP 请求；任何失败都抛 :class:`ToolError`。"""
         try:
             import httpx  # type: ignore
         except ImportError as exc:  # pragma: no cover
-            raise ToolError("httpx is required for web_search") from exc
+            raise ToolError("web_search 工具需要 httpx 依赖") from exc
 
         try:
             with httpx.Client(
@@ -71,18 +73,18 @@ class WebSearchTool(Tool):
                 resp.raise_for_status()
                 return resp.text
         except httpx.HTTPError as exc:
-            raise ToolError(f"web_search HTTP failure: {exc}") from exc
+            raise ToolError(f"web_search HTTP 调用失败：{exc}") from exc
 
 
 # --------------------------------------------------------------------------- #
-# HTML parsing
+# HTML 解析
 # --------------------------------------------------------------------------- #
 
 def _parse_duckduckgo_html(html_text: str, *, limit: int) -> List[Dict[str, str]]:
     try:
         from bs4 import BeautifulSoup  # type: ignore
     except ImportError as exc:  # pragma: no cover
-        raise ToolError("beautifulsoup4 is required for web_search") from exc
+        raise ToolError("web_search 工具需要 beautifulsoup4 依赖") from exc
 
     soup = BeautifulSoup(html_text, "html.parser")
     results: List[Dict[str, str]] = []
@@ -106,7 +108,7 @@ def _parse_duckduckgo_html(html_text: str, *, limit: int) -> List[Dict[str, str]
 
 
 def _strip_duck_redirect(url: str) -> str:
-    """DuckDuckGo HTML often wraps real URLs in a redirector; unwrap if so."""
+    """DuckDuckGo 的 HTML 经常把真实 URL 包在一个重定向链接里，剥掉它。"""
     m = re.search(r"uddg=([^&]+)", url)
     if not m:
         return url
@@ -114,7 +116,7 @@ def _strip_duck_redirect(url: str) -> str:
         from urllib.parse import unquote
 
         return unquote(m.group(1))
-    except Exception:  # pragma: no cover - defensive
+    except Exception:  # pragma: no cover - 防御性
         return url
 
 

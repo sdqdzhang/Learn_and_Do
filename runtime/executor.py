@@ -1,18 +1,17 @@
-"""Docker sandbox executor.
+"""Docker 沙箱执行器。
 
-Responsibilities:
+职责：
 
-1. **File injection.** Materialise the list of :class:`FileOperation` on
-   the host inside ``WORKSPACE_DIR``.
-2. **Container management.** Either reuse a long-lived container (when a
-   :class:`SessionManager` owns one) or spin up a one-shot container.
-3. **Resource control.** Apply CPU / memory limits read from env.
-4. **Bidirectional sync.** After the command exits, run a ``find`` inside
-   the container to discover the resulting file tree, then expose any
-   new artifacts to the caller.
+1. **文件注入。** 把传入的 :class:`FileOperation` 列表落到宿主机的
+   ``WORKSPACE_DIR``。
+2. **容器管理。** 既可以复用一个长生命周期容器（由 :class:`SessionManager`
+   持有），也可以一次性新起 / 删除容器。
+3. **资源约束。** 读取环境变量里的 CPU / 内存配额并应用到容器上。
+4. **双向同步。** 命令退出后再在容器里跑一遍 ``find``，对比出本轮新生成的
+   文件并通过 ``artifacts`` 暴露给调用方。
 
-The Executor is **mode-agnostic**: it doesn't know whether the script is
-a pytest run or a scraping job, and it doesn't need to.
+Executor **任务模式无关**：它不在乎跑的是 pytest 还是爬虫脚本，也不需要
+在乎。
 """
 
 from __future__ import annotations
@@ -38,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Config
+# 配置
 # --------------------------------------------------------------------------- #
 
 @dataclass(frozen=True)
@@ -63,13 +62,13 @@ class ExecutorConfig:
 
 
 # --------------------------------------------------------------------------- #
-# Forbidden command heuristics
+# 危险命令启发式黑名单
 # --------------------------------------------------------------------------- #
 
 _FORBIDDEN_FRAGMENTS = (
     "rm -rf /",
     "rm -rf /*",
-    ":(){:|:&};:",        # fork bomb
+    ":(){:|:&};:",        # fork 炸弹
     "mkfs",
     "dd if=",
     "shutdown",
@@ -82,7 +81,7 @@ def _ensure_command_safe(command: Sequence[str]) -> None:
     for needle in _FORBIDDEN_FRAGMENTS:
         if needle in flat:
             raise SandboxViolation(
-                f"refused to run forbidden command fragment: {needle!r}",
+                f"拒绝执行命中黑名单的指令片段：{needle!r}",
                 details={"command": list(command)},
             )
 
@@ -92,12 +91,11 @@ def _ensure_command_safe(command: Sequence[str]) -> None:
 # --------------------------------------------------------------------------- #
 
 class Executor:
-    """Docker-backed sandbox.
+    """基于 Docker 的沙箱。
 
-    ``container_name`` is optional. When provided, the Executor expects a
-    long-lived container managed by :class:`SessionManager`. When omitted,
-    each :meth:`run` call spins up a fresh container and removes it
-    afterwards.
+    ``container_name`` 是可选参数。传入时表示 Executor 由一个由
+    :class:`SessionManager` 管理的长生命周期容器持有；不传时每次
+    :meth:`run` 都会新起一个一次性容器并在结束后删除。
     """
 
     def __init__(
@@ -110,9 +108,9 @@ class Executor:
         self._workspace = Path(self._config.workspace_dir).resolve()
         self._workspace.mkdir(parents=True, exist_ok=True)
         self._container_name = container_name
-        self._client = None  # lazy
+        self._client = None  # 懒加载
 
-    # ------------------- public ------------------- #
+    # ------------------- 公共 API ------------------- #
 
     @property
     def config(self) -> ExecutorConfig:
@@ -130,7 +128,7 @@ class Executor:
         extra_pip: Optional[Sequence[str]] = None,
         timeout: Optional[int] = None,
     ) -> ExecutionResult:
-        """Apply ``files`` then run ``command`` inside the sandbox."""
+        """先应用 ``files``，再在沙箱里执行 ``command``。"""
         files = files or []
         command = list(command or ["python", "--version"])
         timeout = timeout or self._config.default_timeout
@@ -155,10 +153,10 @@ class Executor:
             raise
         except TinyDevinError:
             raise
-        except Exception as exc:  # noqa: BLE001 -- wrap unexpected errors
-            logger.exception("executor unexpected failure")
+        except Exception as exc:  # noqa: BLE001 -- 把未预期错误统一包成 TinyDevinError
+            logger.exception("executor 发生未预期错误")
             raise TinyDevinError(
-                "executor unexpected failure",
+                "executor 发生未预期错误",
                 details={"error": str(exc)},
             ) from exc
 
@@ -177,11 +175,11 @@ class Executor:
         )
 
     def close(self) -> None:
-        # Owned by SessionManager when ``container_name`` is set; otherwise
-        # one-shot runs already clean themselves up.
+        # 当 ``container_name`` 由 SessionManager 持有时，由 SessionManager
+        # 负责真正的容器清理；一次性容器在 _run_command 内部就已经自删了。
         pass
 
-    # ------------------- file injection ------------------- #
+    # ------------------- 文件注入 ------------------- #
 
     def _apply_files(self, files: List[FileOperation]) -> None:
         for op in files:
@@ -194,7 +192,7 @@ class Executor:
                         target.unlink()
                 continue
             if op.action is FileAction.READ:
-                # READ is a no-op on injection; the tool layer handles reads.
+                # 注入阶段无需处理 READ；读取由工具层负责。
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             content = op.content or ""
@@ -206,12 +204,12 @@ class Executor:
             candidate.relative_to(self._workspace)
         except ValueError as exc:
             raise SandboxViolation(
-                f"file path escapes workspace: {rel_path!r}",
+                f"路径越权访问工作空间之外：{rel_path!r}",
                 details={"resolved": str(candidate)},
             ) from exc
         return candidate
 
-    # ------------------- workspace diffing ------------------- #
+    # ------------------- 工作空间快照差异 ------------------- #
 
     def _snapshot_workspace(self) -> set[str]:
         snapshot: set[str] = set()
@@ -223,7 +221,7 @@ class Executor:
             snapshot.add(str(path.relative_to(self._workspace)).replace("\\", "/"))
         return snapshot
 
-    # ------------------- docker glue ------------------- #
+    # ------------------- Docker 胶水代码 ------------------- #
 
     def _docker_client(self):
         if self._client is not None:
@@ -232,7 +230,7 @@ class Executor:
             import docker  # type: ignore
         except ImportError as exc:  # pragma: no cover
             raise ContainerImageError(
-                "docker SDK not installed; install via requirements.txt",
+                "docker SDK 未安装；请通过 requirements.txt 安装",
             ) from exc
 
         try:
@@ -240,7 +238,7 @@ class Executor:
             self._client.ping()
         except Exception as exc:  # noqa: BLE001
             raise ContainerImageError(
-                "cannot reach docker daemon",
+                "无法连接 docker 守护进程",
                 details={"error": str(exc)},
             ) from exc
         return self._client
@@ -249,9 +247,9 @@ class Executor:
         client = self._docker_client()
         try:
             client.images.get(self._config.image)
-        except Exception as exc:  # noqa: BLE001 -- includes docker.errors.ImageNotFound
+        except Exception as exc:  # noqa: BLE001 -- 含 docker.errors.ImageNotFound
             raise ContainerImageError(
-                f"base image not found: {self._config.image}",
+                f"基础镜像不存在：{self._config.image}",
                 details={"error": str(exc)},
             ) from exc
 
@@ -286,7 +284,7 @@ class Executor:
             )
         except Exception as exc:  # noqa: BLE001
             raise ContainerImageError(
-                "failed to launch sandbox container",
+                "启动沙箱容器失败",
                 details={"error": str(exc)},
             ) from exc
 
@@ -295,20 +293,20 @@ class Executor:
             exit_code = int(wait_result.get("StatusCode", -1))
             stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
             stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
-        except Exception as exc:  # noqa: BLE001 -- treat as fatal timeout / oom
+        except Exception as exc:  # noqa: BLE001 -- 视为超时 / OOM 这类 Fatal
             try:
                 container.kill()
             except Exception:  # noqa: BLE001
                 pass
             raise ResourceExhausted(
-                "container exceeded timeout or was killed by OS",
+                "容器超时或被操作系统强制杀掉",
                 details={"error": str(exc), "timeout_s": timeout},
             ) from exc
         finally:
             try:
                 container.remove(force=True)
             except Exception:  # noqa: BLE001
-                logger.warning("failed to remove container %s", run_name)
+                logger.warning("删除容器 %s 失败", run_name)
 
         env_info = {"image": self._config.image, "container_name": run_name}
         return stdout, stderr, exit_code, env_info
@@ -316,7 +314,7 @@ class Executor:
     def _compose_shell_command(
         self, command: Sequence[str], *, extra_pip: List[str]
     ) -> str:
-        # Quote individual args so a user file with spaces still works.
+        # 对每个参数做引号转义，文件名带空格也能正确传入容器。
         from shlex import quote
 
         quoted_cmd = " ".join(quote(part) for part in command)

@@ -1,12 +1,11 @@
-"""Python REPL tool.
+"""Python REPL 工具。
 
-Executes a snippet of Python code inside the Tiny-Devin sandbox via
-:class:`runtime.executor.Executor`. Keeping execution inside Docker is
-non-negotiable: Agent-emitted code is untrusted by definition.
+通过 :class:`runtime.executor.Executor` 在 Tiny-Devin 沙箱里执行一段 Python
+代码。让代码跑在 Docker 里是不可妥协的底线：Agent 输出的代码默认就是不
+可信的。
 
-The tool is *thin* — it shapes the snippet into a single ``main.py``
-file operation, dispatches it, and converts ``ExecutionResult`` into a
-tool-friendly dict.
+工具本身很薄 —— 把代码片段包装成 ``main.py`` 这一份 FileOperation 提交给
+Executor，再把 ``ExecutionResult`` 转成对工具友好的 dict。
 """
 
 from __future__ import annotations
@@ -22,24 +21,24 @@ class PythonReplTool(Tool):
     spec = ToolSpec(
         name="python_repl",
         description=(
-            "Execute a Python snippet inside the sandbox container. "
-            "Returns stdout, stderr and resulting workspace files."
+            "在沙箱容器内执行一段 Python 代码片段，"
+            "返回 stdout / stderr 以及运行后工作空间里的文件列表。"
         ),
         args_schema={
             "type": "object",
             "properties": {
-                "code": {"type": "string"},
+                "code": {"type": "string", "description": "要执行的 Python 代码片段"},
                 "filename": {
                     "type": "string",
-                    "description": "Workspace path to write the snippet to (default 'main.py').",
+                    "description": "把代码片段写入的工作空间路径，默认 'main.py'。",
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Wall-clock timeout seconds (default: executor's default).",
+                    "description": "墙钟超时秒数，未填则使用执行器的默认值。",
                 },
                 "extra_pip": {
                     "type": "array",
-                    "description": "Extra pip packages to install before execution.",
+                    "description": "运行前需要额外安装的 pip 包列表。",
                 },
             },
             "required": ["code"],
@@ -47,8 +46,8 @@ class PythonReplTool(Tool):
     )
 
     def __init__(self, executor: Optional[Any] = None) -> None:
-        """``executor`` is duck-typed to keep this module decoupled from
-        :mod:`runtime.executor` (handy for tests with a stub executor).
+        """``executor`` 用鸭子类型而不是强引用 :mod:`runtime.executor`，便于
+        单测里塞一个 stub executor。
         """
         self._executor = executor
 
@@ -58,14 +57,14 @@ class PythonReplTool(Tool):
     def call(self, args: Dict[str, Any]) -> Dict[str, Any]:
         if self._executor is None:
             raise ToolError(
-                "python_repl tool has no executor bound; "
-                "call .bind_executor(executor) before use",
+                "python_repl 工具未绑定 executor；"
+                "请先调用 .bind_executor(executor) 再使用",
             )
 
         filename = args.get("filename", "main.py")
         code = args["code"]
         if not code.strip():
-            raise ToolError("code is empty")
+            raise ToolError("code 不能为空")
 
         files = [FileOperation(file_path=filename, content=code)]
         timeout = args.get("timeout")

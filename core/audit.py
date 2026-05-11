@@ -1,14 +1,12 @@
-"""JSON Lines trace logger.
+"""JSON Lines 轨迹日志。
 
-One file per session at ``runtime/traces/{session_id}.jsonl``. Each line
-is a :class:`TraceEvent` serialized to JSON. The format is intentionally
-simple — flat, append-only, line-delimited — so external tools (jq,
-pandas, BI dashboards) can consume it without any custom parser.
+每个 session 写一个文件：``runtime/traces/{session_id}.jsonl``。每一行都是
+一条 ``TraceEvent`` 的 JSON 序列化结果。格式刻意保持简单 —— 扁平、追加、
+按行分隔 —— 这样下游工具（jq、pandas、BI 面板）可以零定制地消费。
 
-Why not just stdlib ``logging``? Trace events are *structured by
-definition* (state machine transitions, prompts, tool I/O); shoving them
-into a free-form log message would require parsing the message back out
-on every read. Keep them structured.
+为什么不直接用标准库 ``logging``？因为轨迹事件天生是结构化的（状态机切换、
+prompt、工具输入输出），如果硬塞进自由文本日志，每次读取都得再做一遍反向
+解析。我们把它们保留为结构化数据。
 """
 
 from __future__ import annotations
@@ -25,8 +23,8 @@ from core.schema import AgentState, TraceEvent
 logger = logging.getLogger(__name__)
 
 
-# Known kinds. Not enforced (free strings allowed) but documented here so
-# downstream consumers can build a stable schema.
+# 已知的事件 kind。kind 字段不强制使用这些常量（允许任意字符串），但定义在
+# 这里，方便下游消费者构建稳定的 schema。
 KIND_PROMPT = "prompt"
 KIND_RESPONSE = "response"
 KIND_TOOL_CALL = "tool_call"
@@ -39,7 +37,7 @@ KIND_PLAN = "plan"
 
 
 class TraceLogger:
-    """Append-only structured logger; safe to use from multiple threads."""
+    """追加式结构化日志写入器；多线程安全。"""
 
     def __init__(
         self,
@@ -53,7 +51,7 @@ class TraceLogger:
         self._lock = threading.Lock()
         self._fh = self._path.open("a", encoding="utf-8")
 
-    # ------------------- properties ------------------- #
+    # ------------------- 属性 ------------------- #
 
     @property
     def path(self) -> Path:
@@ -63,7 +61,7 @@ class TraceLogger:
     def session_id(self) -> str:
         return self._session_id
 
-    # ------------------- write ------------------- #
+    # ------------------- 写入 ------------------- #
 
     def log(
         self,
@@ -91,7 +89,7 @@ class TraceLogger:
             self._fh.write(line + "\n")
             self._fh.flush()
 
-    # ------------------- lifecycle ------------------- #
+    # ------------------- 生命周期 ------------------- #
 
     def close(self) -> None:
         with self._lock:
@@ -100,7 +98,7 @@ class TraceLogger:
                     self._fh.flush()
                     self._fh.close()
                 except Exception:  # noqa: BLE001
-                    logger.exception("failed to close trace file %s", self._path)
+                    logger.exception("关闭轨迹文件失败：%s", self._path)
 
     def __enter__(self) -> "TraceLogger":
         return self
@@ -108,7 +106,7 @@ class TraceLogger:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
-    def __del__(self) -> None:  # pragma: no cover - best effort
+    def __del__(self) -> None:  # pragma: no cover - 尽力而为
         try:
             self.close()
         except Exception:
@@ -116,11 +114,11 @@ class TraceLogger:
 
 
 # --------------------------------------------------------------------------- #
-# Reader helper (handy for tests and offline replay)
+# 读取辅助函数（方便测试与离线回放）
 # --------------------------------------------------------------------------- #
 
 def read_trace(path: str) -> list[TraceEvent]:
-    """Load a JSONL trace file into a list of :class:`TraceEvent`."""
+    """把一个 JSONL 轨迹文件读成 :class:`TraceEvent` 列表。"""
     events: list[TraceEvent] = []
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:

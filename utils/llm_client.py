@@ -1,15 +1,13 @@
-"""LLM client wrapping Ollama via the OpenAI-compatible API.
+"""LLM 客户端：通过 OpenAI 兼容接口对接 Ollama。
 
-This module is intentionally agnostic to task type (code / philosophy /
-anything else). It only knows how to:
+本模块刻意保持与任务模式无关（不管是代码、哲学还是别的），只负责三件事：
 
-1. Read connection settings from environment variables (or an explicit
-   ``LLMConfig``).
-2. Send a chat-completion request, with retry on transient failures.
-3. Return the assistant's text content.
+1. 从环境变量（或显式传入的 ``LLMConfig``）读取连接配置。
+2. 发起一次 chat completion 请求，自动重试瞬态错误。
+3. 返回 assistant 的文本内容。
 
-Higher layers are responsible for prompt construction (``prompt_templates``)
-and response parsing (``utils.parser``).
+更上层的职责（prompt 拼装、响应解析）分别由 ``prompt_templates`` 与
+``utils.parser`` 承担。
 """
 
 from __future__ import annotations
@@ -28,12 +26,12 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Configuration
+# 配置
 # --------------------------------------------------------------------------- #
 
 @dataclass(frozen=True)
 class LLMConfig:
-    """All knobs the client cares about. Immutable so it is safe to share."""
+    """客户端需要的全部参数。不可变，方便安全地多处共享同一份配置。"""
 
     base_url: str
     api_key: str
@@ -44,11 +42,10 @@ class LLMConfig:
 
     @classmethod
     def from_env(cls, *, load_dotenv_file: bool = True) -> "LLMConfig":
-        """Build a config from environment variables.
+        """从环境变量构造一份配置。
 
-        ``load_dotenv_file=True`` will try to load a ``.env`` file from the
-        current working directory if one exists. Existing env vars are NOT
-        overridden, matching python-dotenv's default behaviour.
+        ``load_dotenv_file=True`` 时会尝试在当前工作目录加载 ``.env``。
+        已存在的环境变量不会被覆盖（与 python-dotenv 默认行为一致）。
         """
         if load_dotenv_file:
             try:
@@ -56,7 +53,7 @@ class LLMConfig:
 
                 load_dotenv()
             except ImportError:
-                logger.debug("python-dotenv not installed; skipping .env load")
+                logger.debug("未安装 python-dotenv，跳过 .env 加载")
 
         return cls(
             base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
@@ -68,17 +65,17 @@ class LLMConfig:
         )
 
 
-# A loose alias so callers don't need to import OpenAI's types just to
-# pass a list of {"role": ..., "content": ...} dicts.
+# 宽松的别名 —— 让调用方不必为了塞一个 {"role": ..., "content": ...} dict 而
+# 去 import openai 自己的 typed dict。
 ChatMessage = Mapping[str, Any]
 
 
 # --------------------------------------------------------------------------- #
-# Client
+# 客户端
 # --------------------------------------------------------------------------- #
 
 class LLMClient:
-    """Thin wrapper around ``openai.OpenAI`` configured for an Ollama backend."""
+    """对 ``openai.OpenAI`` 的薄包装，预先配置好对接 Ollama 后端。"""
 
     def __init__(self, config: Optional[LLMConfig] = None) -> None:
         self._config = config or LLMConfig.from_env()
@@ -97,7 +94,7 @@ class LLMClient:
         return self._config.model
 
     # --------------------------------------------------------------------- #
-    # Public API
+    # 公共 API
     # --------------------------------------------------------------------- #
 
     def chat(
@@ -109,11 +106,10 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         extra: Optional[dict] = None,
     ) -> str:
-        """Synchronous chat completion. Returns the assistant text content.
+        """同步 chat completion，返回 assistant 的文本内容。
 
-        Retries on timeout, transient connection errors, and rate-limit
-        responses, up to ``config.max_retries`` extra attempts. After the
-        budget is exhausted, raises :class:`LLMTimeoutError`.
+        会在遇到超时、瞬态连接错误、限流响应时按 ``config.max_retries`` 重试。
+        预算耗尽时抛 :class:`LLMTimeoutError`。
         """
         return self._with_retries(
             lambda: self._chat_once(
@@ -134,10 +130,10 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         extra: Optional[dict] = None,
     ) -> Iterator[str]:
-        """Streaming variant. Yields content deltas as they arrive.
+        """流式版本，逐 chunk 产出文本增量。
 
-        Streaming responses are NOT retried mid-stream; if the very first
-        request errors out, the same retry policy as ``chat`` applies.
+        流式响应一旦开始就不会中途重试；只有最开始那一次请求失败时才会按
+        与 :meth:`chat` 相同的策略重试。
         """
         stream = self._with_retries(
             lambda: self._client.chat.completions.create(
@@ -159,7 +155,7 @@ class LLMClient:
                 yield content
 
     # --------------------------------------------------------------------- #
-    # Internals
+    # 内部实现
     # --------------------------------------------------------------------- #
 
     def _chat_once(
@@ -194,13 +190,13 @@ class LLMClient:
                 return call()
             except APITimeoutError as exc:
                 last_error = exc
-                logger.warning("LLM timeout (attempt %s/%s): %s", attempt, attempts, exc)
+                logger.warning("LLM 超时（第 %s/%s 次尝试）：%s", attempt, attempts, exc)
             except (APIConnectionError, RateLimitError) as exc:
                 last_error = exc
-                logger.warning("LLM transient error (attempt %s/%s): %s", attempt, attempts, exc)
+                logger.warning("LLM 瞬态错误（第 %s/%s 次尝试）：%s", attempt, attempts, exc)
             except APIError as exc:
-                # Non-transient API error: surface immediately, don't retry.
-                logger.error("LLM API error: %s", exc)
+                # 非瞬态 API 错误：立即抛出，不再重试。
+                logger.error("LLM API 错误：%s", exc)
                 raise
 
             if attempt < attempts:
@@ -208,7 +204,7 @@ class LLMClient:
                 time.sleep(backoff)
 
         raise LLMTimeoutError(
-            f"LLM request failed after {attempts} attempt(s)",
+            f"LLM 请求在 {attempts} 次尝试后仍然失败",
             details=str(last_error) if last_error else None,
         ) from last_error
 

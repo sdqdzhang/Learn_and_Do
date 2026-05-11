@@ -1,17 +1,15 @@
-"""Unified exception hierarchy for Tiny-Devin.
+"""Tiny-Devin 统一异常体系。
 
-The tree has two top-level branches that map directly onto the workflow
-layer's decision logic:
+整棵异常树有两个顶层分支，对应 workflow 的控制流分流逻辑：
 
     TinyDevinError
-    ├── RetryableError   --> workflow may retry within the same session
-    └── FatalError       --> workflow must abort the session
+    ├── RetryableError   --> workflow 可以在同一个 session 内重试
+    └── FatalError       --> workflow 必须立刻终止 session
 
-Domain-specific failure signals (a unit test failing, a hypothesis being
-falsified) are NOT modeled as exceptions; they are data carried inside
-``ExecutionResult`` / ``Evidence`` and surfaced to the workflow via
-``EvidenceConflict``. This keeps the exception layer purpose-agnostic so
-both DEVELOPMENT and PHILOSOPHY modes share the same catch sites.
+业务侧的失败信号（单元测试失败、假设被证伪）**不**建模成异常，而是承载在
+``ExecutionResult`` / ``Evidence`` 里，由 workflow 决定是否升格成
+``EvidenceConflict``。这样异常层保持任务模式无关，DEVELOPMENT 与 PHILOSOPHY
+共用同一套 except 分支。
 """
 
 from __future__ import annotations
@@ -20,82 +18,81 @@ from typing import Any, Optional
 
 
 class TinyDevinError(Exception):
-    """Root of every custom exception raised by this project."""
+    """项目中所有自定义异常的根类。"""
 
     def __init__(self, message: str = "", *, details: Optional[Any] = None) -> None:
         super().__init__(message)
         self.message = message
         self.details = details
 
-    def __str__(self) -> str:  # pragma: no cover - trivial
+    def __str__(self) -> str:  # pragma: no cover - 简单字符串拼接
         if self.details is None:
             return self.message
         return f"{self.message} | details={self.details!r}"
 
 
 class RetryableError(TinyDevinError):
-    """Errors the workflow may retry without aborting the session."""
+    """可被 workflow 在不中止 session 的前提下重试的错误。"""
 
 
 class FatalError(TinyDevinError):
-    """Errors that must terminate the current session immediately."""
+    """必须立即终止当前 session 的错误。"""
 
 
 # --------------------------------------------------------------------------- #
-# Retryable
+# 可重试 (Retryable)
 # --------------------------------------------------------------------------- #
 
 class CodeFormatError(RetryableError):
-    """LLM output did not contain a parseable ``<file>`` or ``<thought>`` block."""
+    """LLM 输出无法解析为 <file> / <thought> / <tool> / json 块。"""
 
 
 class MissingPathError(RetryableError):
-    """A code block was found but had no ``path`` attribute."""
+    """找到了代码块但缺少 ``path`` 属性。"""
 
 
 class LLMTimeoutError(RetryableError):
-    """LLM did not respond within the configured timeout / retry budget."""
+    """LLM 在配置的超时 / 重试预算内没有响应。"""
 
 
 class EvidenceConflict(RetryableError):
-    """Executor produced data that contradicts the current claim.
+    """Executor 返回的数据与当前主张冲突。
 
-    - DEVELOPMENT mode: tests failed; ask Coder to fix.
-    - PHILOSOPHY  mode: data falsified the hypothesis; ask Philosopher
-      to revise the model.
+    - DEVELOPMENT 模式：单元测试失败，让 Coder 修。
+    - PHILOSOPHY  模式：数据反驳了假设，让 Philosopher 修订模型。
     """
 
 
 class ToolError(RetryableError):
-    """A tool invocation failed in a way the workflow can retry.
+    """工具调用失败但可重试。
 
-    Distinct from SandboxViolation: the tool ran but produced an error
-    result (network hiccup, file not found, bad args, etc.).
+    与 SandboxViolation 不同：工具实际跑起来了，只是产出了错误结果
+    （网络抖动、文件不存在、参数错误等）。
     """
 
 
 class MemoryError(RetryableError):
-    """Memory layer transient failure (vector store disk hiccup, etc.)."""
+    """记忆层瞬态故障（如向量库磁盘抖动）。"""
 
 
 # --------------------------------------------------------------------------- #
-# Fatal
+# 熔断 (Fatal)
 # --------------------------------------------------------------------------- #
 
 class SandboxViolation(FatalError):
-    """Agent attempted a forbidden operation (e.g. ``rm -rf /``)."""
+    """Agent 试图执行违规操作（例如 rm -rf /）。"""
 
 
 class ContainerImageError(FatalError):
-    """Required base Docker image is missing or cannot be built."""
+    """基础 Docker 镜像缺失或无法构建。"""
 
 
 class ResourceExhausted(FatalError):
-    """Container exceeded configured memory / GPU / disk quotas."""
+    """容器超过了内存 / GPU / 磁盘配额。"""
 
 
 class ConfigurationError(FatalError):
-    """Required configuration is missing or invalid (e.g. unreachable Ollama)."""
+    """必需的配置缺失或非法（例如 Ollama 不可达）。"""
 
 
 __all__ = [

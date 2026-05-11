@@ -1,22 +1,21 @@
-"""CLI entrypoint.
+"""命令行入口。
 
-Usage examples
---------------
+使用示例
+--------
 
-Code agent:
+代码 Agent：
 
     python main.py --mode development --role coder \
-        --prompt "Write a Python function that reverses a string and prove it works"
+        --prompt "写一个反转字符串的 Python 函数，并用单测证明它能跑"
 
-Philosophy agent:
+哲学 Agent：
 
     python main.py --mode philosophy --role philosopher \
-        --prompt "Does technological progress increase human happiness?"
+        --prompt "技术进步是否真的提升了人类的幸福感？"
 
-The entrypoint wires together every layer: LLMClient, SessionManager
-(+ Executor), ToolRegistry, SessionContext, TraceLogger, and Workflow.
-It is intentionally small — all the interesting behaviour lives in
-``core/workflow.py``.
+入口脚本只负责把各层拼起来：LLMClient、SessionManager（含 Executor）、
+ToolRegistry、SessionContext、TraceLogger、Workflow。它刻意保持精简 ——
+所有"有意思的行为"都在 ``core/workflow.py`` 里。
 """
 
 from __future__ import annotations
@@ -51,16 +50,18 @@ def _setup_logging() -> None:
 
 
 def _build_summarizer(client: LLMClient):
-    """Return a function that condenses a list of ChatMessage into one string.
+    """返回一个把 List[ChatMessage] 浓缩成单条文本的函数。
 
-    Used by :class:`SessionContext` when its token budget overflows.
+    :class:`SessionContext` 在 token 预算溢出时会调用它。
     """
 
     def summarize(messages) -> str:
         prompt = (
-            "Compress the following conversation into a concise digest. "
-            "Preserve every decision, every conflict, and every file that was created. "
-            "Drop greetings and filler. Output plain prose, <300 words."
+            "请把下面这段对话压缩成一份简洁的摘要。"
+            "必须完整保留：每一个已做出的决定、每一个出现过的冲突、"
+            "以及每一个被创建或修改的文件。"
+            "请省略问候语和与任务无关的寒暄。"
+            "输出纯文本叙述，控制在 300 字以内，使用中文。"
         )
         flat = "\n\n".join(f"[{m.role.value}] {m.content}" for m in messages)
         return client.chat(
@@ -100,36 +101,40 @@ def _register_tools(
 def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="tiny-devin",
-        description="Run a single Agent session (code or philosophy).",
+        description="运行一次单 session 的 Agent 会话（代码模式或哲学模式）。",
     )
     p.add_argument(
         "--mode",
         choices=[m.value for m in TaskMode],
         default=TaskMode.DEVELOPMENT.value,
-        help="Task mode: development or philosophy.",
+        help="任务模式：development（代码开发）或 philosophy（哲学研究）。",
     )
     p.add_argument(
         "--role",
         choices=[r.value for r in AgentRole],
         default=AgentRole.CODER.value,
-        help="Initial agent role for the conversation.",
+        help="本次对话初始的 Agent 角色。",
     )
     p.add_argument(
         "--prompt",
         required=True,
-        help="The user prompt that kicks off the session.",
+        help="启动整个 session 的用户指令。",
     )
     p.add_argument(
         "--max-turns",
         type=int,
         default=None,
-        help="Override WORKFLOW_MAX_TURNS env for this run.",
+        help="覆盖环境变量 WORKFLOW_MAX_TURNS，仅对本次运行生效。",
     )
     p.add_argument(
-        "--no-search", action="store_true", help="Disable the web_search tool."
+        "--no-search",
+        action="store_true",
+        help="禁用 web_search 工具（不访问外网）。",
     )
     p.add_argument(
-        "--no-rag", action="store_true", help="Disable RAG tools (vector store)."
+        "--no-rag",
+        action="store_true",
+        help="禁用 RAG 工具（不加载向量库）。",
     )
     return p.parse_args(argv)
 
@@ -147,7 +152,7 @@ def main(argv: Optional[list] = None) -> int:
     try:
         session_id = session.start()
     except FatalError as exc:
-        print(f"failed to start session: {exc}", file=sys.stderr)
+        print(f"启动 session 失败：{exc}", file=sys.stderr)
         return 2
 
     trace = TraceLogger(session_id=session_id)
@@ -182,18 +187,18 @@ def main(argv: Optional[list] = None) -> int:
     try:
         result = workflow.run(args.prompt)
     except ConfigurationError as exc:
-        print(f"configuration error: {exc}", file=sys.stderr)
+        print(f"配置错误：{exc}", file=sys.stderr)
         return 2
     finally:
         trace.close()
         session.stop()
 
     print("=" * 60)
-    print(f"session_id : {result.session_id}")
-    print(f"final_state: {result.final_state.value}")
-    print(f"turns      : {result.turns}")
+    print(f"会话 ID    ：{result.session_id}")
+    print(f"最终状态   ：{result.final_state.value}")
+    print(f"轮次       ：{result.turns}")
     if result.error:
-        print(f"error      : {result.error}")
+        print(f"错误信息   ：{result.error}")
     if result.last_message:
         print("-" * 60)
         print(result.last_message)

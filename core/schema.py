@@ -1,10 +1,8 @@
-"""Pydantic v2 protocol definitions.
+"""Pydantic v2 协议定义。
 
-This module is the single source of truth for every payload that crosses
-module boundaries (LLM messages, tool calls, execution results, trace
-events, plans, reflections). It must remain **mode-agnostic**: the same
-schema serves both DEVELOPMENT (code agent) and PHILOSOPHY (research
-agent) workloads.
+本模块是项目里所有跨模块传递数据（LLM 消息、工具调用、执行结果、轨迹事件、
+计划、反思）的唯一真源。它必须保持 **任务模式无关**：DEVELOPMENT（代码 Agent）
+与 PHILOSOPHY（哲学研究 Agent）共用同一套 Schema。
 """
 
 from __future__ import annotations
@@ -18,7 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 # --------------------------------------------------------------------------- #
-# Enums
+# 枚举
 # --------------------------------------------------------------------------- #
 
 class MessageRole(str, Enum):
@@ -71,27 +69,27 @@ class AgentRole(str, Enum):
 
 
 # --------------------------------------------------------------------------- #
-# Conversation payloads
+# 对话相关
 # --------------------------------------------------------------------------- #
 
 class ChatMessage(BaseModel):
-    """A single turn in the conversation log.
+    """对话日志里的一轮消息。
 
-    ``thought`` is required when the workflow is in PHILOSOPHY mode and the
-    role is ASSISTANT; enforcement happens at the parser layer rather than
-    here so this model stays reusable in unit tests.
+    当 workflow 处于 PHILOSOPHY 模式且 ``role`` 为 ASSISTANT 时，``thought``
+    必须有值；该约束由 parser 层执行，模型本身不强制（这样在单测里这个模型
+    仍能复用）。
     """
 
     role: MessageRole
     content: str
     thought: Optional[str] = None
-    # Only required when role == TOOL: which tool_call this message answers.
+    # 仅当 role == TOOL 时必填：标识本条消息回应的是哪个 tool_call。
     tool_call_id: Optional[str] = None
-    # Free-form metadata (timestamps, model name, etc.).
+    # 自由元数据（时间戳、模型名等）。
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
     def to_openai(self) -> Dict[str, Any]:
-        """Render to the dict shape openai's SDK expects."""
+        """渲染成 openai SDK 期望的 dict 形态。"""
         out: Dict[str, Any] = {"role": self.role.value, "content": self.content}
         if self.tool_call_id is not None:
             out["tool_call_id"] = self.tool_call_id
@@ -99,43 +97,42 @@ class ChatMessage(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# File operations (used by both <file> blocks and the file_io tool)
+# 文件操作（同时被 <file> 块与 file_io 工具使用）
 # --------------------------------------------------------------------------- #
 
 class FileOperation(BaseModel):
-    file_path: str = Field(..., description="Workspace-relative path")
+    file_path: str = Field(..., description="相对于工作空间的相对路径")
     content: Optional[str] = None
     action: FileAction = FileAction.WRITE
 
     @field_validator("file_path")
     @classmethod
     def _no_escape(cls, v: str) -> str:
-        # Defensive: block absolute paths and parent-traversal so a malicious
-        # LLM cannot write outside the workspace. Executor performs its own
-        # check too; this is belt-and-suspenders.
+        # 防御性校验：拒绝绝对路径与父级穿越，避免恶意 LLM 写到工作空间之外。
+        # Executor 还会再校验一次；这里属于双保险。
         v_clean = v.strip()
         if not v_clean:
-            raise ValueError("file_path must be non-empty")
+            raise ValueError("file_path 不能为空")
         if v_clean.startswith(("/", "\\")):
-            raise ValueError("file_path must be relative")
+            raise ValueError("file_path 必须是相对路径")
         if ".." in v_clean.replace("\\", "/").split("/"):
-            raise ValueError("file_path must not contain '..'")
+            raise ValueError("file_path 不允许出现 '..'")
         return v_clean
 
 
 # --------------------------------------------------------------------------- #
-# Evidence (mode-agnostic data point supporting/refuting a claim)
+# 证据（模式无关的数据点，可支持或反驳某个主张）
 # --------------------------------------------------------------------------- #
 
 class Evidence(BaseModel):
     type: EvidenceType
-    source: str = Field(..., description="URL, relative path or script name")
-    summary: str = Field(..., description="1-3 sentences interpreting the evidence")
+    source: str = Field(..., description="URL、相对路径或脚本名")
+    summary: str = Field(..., description="1-3 句话解读这条证据")
     payload: Optional[Dict[str, Any]] = None
 
 
 # --------------------------------------------------------------------------- #
-# Execution results
+# 执行结果
 # --------------------------------------------------------------------------- #
 
 class ExecutionResult(BaseModel):
@@ -149,7 +146,7 @@ class ExecutionResult(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Tools
+# 工具
 # --------------------------------------------------------------------------- #
 
 class ToolCall(BaseModel):
@@ -168,17 +165,16 @@ class ToolResult(BaseModel):
 
 
 class ToolSpec(BaseModel):
-    """Declarative description of a tool, surfaced to the LLM in prompts."""
+    """工具的声明式描述，会被注入到 system prompt 让 LLM 看到。"""
 
     name: str
     description: str
-    # JSON Schema for the args dict. We don't enforce strict schema parsing
-    # in this base layer; tools validate themselves.
+    # args dict 的 JSON Schema。基础层不强制全量 schema 校验，工具自己负责校验。
     args_schema: Dict[str, Any] = Field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
-# Planning & Reflection (the cognitive loop's intermediate artifacts)
+# 规划与反思（认知循环的中间产物）
 # --------------------------------------------------------------------------- #
 
 class Plan(BaseModel):
@@ -192,15 +188,15 @@ ReflectionDecision = Literal["retry", "revise", "done"]
 
 class Reflection(BaseModel):
     plan_ref: Optional[str] = Field(
-        default=None, description="A short tag pointing at the plan being reviewed"
+        default=None, description="指向当前被复核的计划的短标识"
     )
-    observations: str = Field(..., description="What actually happened this turn")
+    observations: str = Field(..., description="本轮实际发生了什么")
     conflicts: List[Evidence] = Field(default_factory=list)
     next_action: ReflectionDecision
 
 
 # --------------------------------------------------------------------------- #
-# Trace event (audit log line)
+# 轨迹事件（写入审计日志的一行）
 # --------------------------------------------------------------------------- #
 
 class TraceEvent(BaseModel):
@@ -213,16 +209,16 @@ class TraceEvent(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Parser output (returned by utils.parser)
+# 解析输出（utils.parser 的返回结构）
 # --------------------------------------------------------------------------- #
 
 class ParsedOutput(BaseModel):
     files: List[FileOperation] = Field(default_factory=list)
     thoughts: List[str] = Field(default_factory=list)
     tool_calls: List[ToolCall] = Field(default_factory=list)
-    # Free-form structured payloads (Plan / Reflection / etc.).
+    # 自由形式的结构化载荷（Plan / Reflection 等）。
     json_blocks: List[Dict[str, Any]] = Field(default_factory=list)
-    # Whatever didn't match any structured block — kept for fallback logging.
+    # 未匹配到任何结构化块的原文，保留供回退日志使用。
     raw_text: str = ""
 
     def is_empty(self) -> bool:
@@ -230,7 +226,7 @@ class ParsedOutput(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Workflow result (returned to main.py)
+# Workflow 最终结果（返回给 main.py）
 # --------------------------------------------------------------------------- #
 
 class WorkflowResult(BaseModel):
@@ -243,14 +239,14 @@ class WorkflowResult(BaseModel):
 
 
 __all__ = [
-    # Enums
+    # 枚举
     "MessageRole", "FileAction", "TaskMode", "EvidenceType",
     "ToolStatus", "AgentState", "AgentRole",
-    # Models
+    # 模型
     "ChatMessage", "FileOperation", "Evidence", "ExecutionResult",
     "ToolCall", "ToolResult", "ToolSpec",
     "Plan", "Reflection", "TraceEvent",
     "ParsedOutput", "WorkflowResult",
-    # Types
+    # 类型别名
     "ReflectionDecision",
 ]

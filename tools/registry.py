@@ -1,10 +1,9 @@
-"""Tool registry.
+"""工具注册表。
 
-Holds a collection of :class:`Tool` instances and dispatches
-:class:`ToolCall` objects to the matching one. Keeping discovery in a
-registry (rather than a global ``invoke_tool`` switch statement) means
-``main.py`` can register the exact tools each session needs and the
-workflow stays mode-agnostic.
+持有一组 :class:`Tool` 实例，并把 :class:`ToolCall` 路由到对应的实例上。
+把工具发现集中放进注册表（而不是写一个全局 ``invoke_tool`` 的 switch），
+是为了让 ``main.py`` 能够按需要给每个 session 注册不同的工具集，而
+workflow 内部保持任务模式无关。
 """
 
 from __future__ import annotations
@@ -20,25 +19,25 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: Dict[str, Tool] = {}
 
-    # ------------------- registration ------------------- #
+    # ------------------- 注册 / 注销 ------------------- #
 
     def register(self, tool: Tool, *, overwrite: bool = False) -> None:
         name = tool.spec.name
         if name in self._tools and not overwrite:
-            raise ValueError(f"tool '{name}' is already registered")
+            raise ValueError(f"工具 '{name}' 已经注册过了")
         self._tools[name] = tool
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
 
-    # ------------------- introspection ------------------- #
+    # ------------------- 内省 ------------------- #
 
     def get(self, name: str) -> Tool:
         try:
             return self._tools[name]
         except KeyError as exc:
             raise ToolError(
-                f"no such tool: '{name}'",
+                f"未注册的工具：'{name}'",
                 details={"available": sorted(self._tools)},
             ) from exc
 
@@ -51,7 +50,7 @@ class ToolRegistry:
     def names(self) -> List[str]:
         return sorted(self._tools)
 
-    # ------------------- dispatch ------------------- #
+    # ------------------- 分发 ------------------- #
 
     def invoke(self, call: ToolCall) -> ToolResult:
         tool = self.get(call.name)

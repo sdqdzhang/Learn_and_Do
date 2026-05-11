@@ -1,368 +1,477 @@
-# Tiny-Devin 基础层 API 手册
+# Tiny-Devin 基础层 API 手册 (V1.3)
 
-本文档面向**基础层之上的开发者**（写 `parser.py` / `executor.py` / `workflow.py` / `prompt_templates.py` / `main.py` 的人），总结当前已稳定的"基础设施"如何被调用。
+本手册面向写应用代码（接入新工具、新角色、新流程）的开发者，覆盖 V1.3 已经稳定的四层基础层：
 
-> 范围：仅覆盖与业务无关、可复用的库层 —— 异常体系、LLM 客户端、配置约定、测试基建。
-> 业务模块（`schema` / `parser` / `executor` / `workflow` / `session_manager` / `prompt_templates`）尚未实现，本文档不涉及。
+- 认知层（`utils.llm_client`、`utils.parser`、`prompt_templates`）
+- 执行层（`runtime.executor`、`tools.*`）
+- 记忆层（`memory.session_context`、`memory.vector_store`）
+- 编排层（`core.workflow`、`core.session_manager`、`core.audit`）
+
+横切的协议层与异常层（`core.schema` / `core.exceptions`）贯穿所有层。
 
 ---
 
 ## 目录
 
+- [0. 60 秒上手](#0-60-秒上手)
 - [1. 配置约定](#1-配置约定)
-- [2. `utils.llm_client`](#2-utilsllm_client)
-  - [2.1 `LLMConfig`](#21-llmconfig)
-  - [2.2 `LLMClient`](#22-llmclient)
-  - [2.3 调用示例](#23-调用示例)
-- [3. `core.exceptions`](#3-coreexceptions)
-  - [3.1 异常树](#31-异常树)
-  - [3.2 上层处理范式](#32-上层处理范式)
-- [4. 跨模块组合范式](#4-跨模块组合范式)
-- [5. 测试基建](#5-测试基建)
-- [6. 沙箱基础镜像](#6-沙箱基础镜像)
-- [7. 待业务层补全的接口位](#7-待业务层补全的接口位)
+- [2. 协议层 `core.schema`](#2-协议层-coreschema)
+- [3. 异常层 `core.exceptions`](#3-异常层-coreexceptions)
+- [4. 认知层](#4-认知层)
+  - [4.1 `utils.llm_client`](#41-utilsllm_client)
+  - [4.2 `utils.parser`](#42-utilsparser)
+  - [4.3 `prompt_templates`](#43-prompt_templates)
+- [5. 执行层](#5-执行层)
+  - [5.1 `runtime.executor`](#51-runtimeexecutor)
+  - [5.2 `tools.*` 与 `ToolRegistry`](#52-tools-与-toolregistry)
+  - [5.3 写一个新工具](#53-写一个新工具)
+- [6. 记忆层](#6-记忆层)
+  - [6.1 `memory.session_context`](#61-memorysession_context)
+  - [6.2 `memory.vector_store`](#62-memoryvector_store)
+- [7. 编排层](#7-编排层)
+  - [7.1 `core.session_manager`](#71-coresession_manager)
+  - [7.2 `core.audit`](#72-coreaudit)
+  - [7.3 `core.workflow`](#73-coreworkflow)
+- [8. 端到端组装范例](#8-端到端组装范例)
+- [9. 测试基建](#9-测试基建)
+
+---
+
+## 0. 60 秒上手
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env             # 编辑 OLLAMA_MODEL
+docker build -t tiny-devin-base:latest .
+
+# 代码模式
+python main.py --mode development --role coder \
+  --prompt "Write a Python function that reverses a string."
+
+# 哲学模式
+python main.py --mode philosophy --role philosopher \
+  --prompt "Does technology increase human happiness?"
+```
+
+`main.py` 干的事就是把本手册讲到的所有层装到一起。
 
 ---
 
 ## 1. 配置约定
 
-所有配置统一通过 **环境变量** 读取，模板见 `.env.example`。开发时复制一份：
-
-```bash
-cp .env.example .env
-```
-
-然后改 `.env` 里的 `OLLAMA_MODEL` 等字段。
-
-### 关键约定
-
-- 任何模块需要配置时，**自定义 `XxxConfig` 数据类 + `from_env()` 工厂方法**，而不是直接 `os.getenv()` 散落各处。`LLMConfig` 是范本。
-- `from_env()` 默认会尝试 `load_dotenv()`，因此**模块独立可用**，不依赖 `main.py` 必须先调一次 dotenv。
-- 已存在的环境变量**不会被 `.env` 覆盖**（python-dotenv 默认行为），允许 CI / 临时 export 优先生效。
-
-### 现有环境变量速查
-
-| 类别 | 变量 | 默认值 | 说明 |
-|---|---|---|---|
-| LLM | `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | OpenAI 兼容端点 |
-| LLM | `OLLAMA_API_KEY` | `ollama` | Ollama 忽略，但 SDK 必填 |
-| LLM | `OLLAMA_MODEL` | `your-model-name` | 必须改成本地实际拉取的模型 |
-| LLM | `LLM_TIMEOUT_SECONDS` | `120` | 单次请求超时 |
-| LLM | `LLM_MAX_RETRIES` | `2` | 瞬态失败后**额外**尝试次数（不含首次请求）；总次数 = `1 + LLM_MAX_RETRIES`（默认 `2` → 最多 3 次） |
-| LLM | `LLM_TEMPERATURE` | `0.2` | 默认采样温度 |
-| Docker | `DOCKER_BASE_IMAGE` | `tiny-devin-base:latest` | 沙箱镜像 |
-| Docker | `CONTAINER_NAME_PREFIX` | `tiny-devin` | 容器名前缀 |
-| Docker | `CONTAINER_MEMORY_LIMIT` | `2g` | 容器内存配额 |
-| Docker | `CONTAINER_CPU_LIMIT` | `2.0` | 容器 CPU 配额 |
-| Docker | `CONTAINER_IDLE_TIMEOUT_SECONDS` | `3600` | 空闲强停时间 |
-| Docker | `CONTAINER_HEARTBEAT_INTERVAL_SECONDS` | `600` | session_manager 心跳 |
-| Workspace | `WORKSPACE_DIR` | `./runtime/workspace` | 双向同步目录 |
-| Logging | `LOG_LEVEL` | `INFO` | stdlib logging 级别 |
+- 所有配置通过环境变量读取。每个组件自带一个 `XxxConfig.from_env()` 工厂方法；不要在业务代码里散落 `os.getenv()`。
+- `.env` 由 `LLMConfig.from_env()` 在第一次实例化时自动加载（idempotent，不覆盖已有 env）。
+- 全量变量见 `.env.example`；新模块若引入新变量，**先加 `.env.example` 再写代码**。
 
 ---
 
-## 2. `utils.llm_client`
+## 2. 协议层 `core.schema`
 
-任何 Agent 角色（Coder / Reviewer / Philosopher / Investigator）都通过这一层调模型。它**不感知 TaskMode**，只负责"发消息、收文本、出错时按策略重试"。
+所有跨模块传递的数据都在这里。Pydantic v2 模型。
 
-### 2.1 `LLMConfig`
-
-不可变数据类，集中所有 LLM 相关参数。
-
-```python
-from utils.llm_client import LLMConfig
-
-# 从环境变量构造（默认行为）
-cfg = LLMConfig.from_env()
-
-# 也可手动指定（测试 / 多模型路由场景常用）
-cfg = LLMConfig(
-    base_url="http://localhost:11434/v1",
-    api_key="ollama",
-    model="qwen2.5-coder:7b",
-    timeout_seconds=60.0,
-    max_retries=3,
-    temperature=0.0,
-)
-```
-
-### 2.2 `LLMClient`
-
-| 方法 | 签名 | 用途 |
+| 类别 | 类型 | 说明 |
 |---|---|---|
-| `__init__(config=None)` | 不传则 `LLMConfig.from_env()` | 创建客户端 |
-| `chat(messages, **kw)` | 返回 `str` | 同步对话，自带重试 |
-| `stream_chat(messages, **kw)` | 返回 `Iterator[str]` | 流式对话，逐 chunk yield |
-| `model` (property) | `str` | 当前默认模型名 |
-| `config` (property) | `LLMConfig` | 当前配置 |
+| 枚举 | `MessageRole`, `FileAction`, `TaskMode`, `EvidenceType`, `ToolStatus`, `AgentState`, `AgentRole` | — |
+| 对话 | `ChatMessage` | `role`/`content`/可选 `thought`/`tool_call_id`/`metadata` |
+| 文件 | `FileOperation` | 内置防越权校验（拒绝绝对路径与 `..`） |
+| 证据 | `Evidence` | 三种 `EvidenceType`：`CODE_RESULT` / `WEB_SOURCE` / `DATA_FILE` |
+| 执行 | `ExecutionResult` | 含 `artifacts` 字段（本轮新生成的文件） |
+| 工具 | `ToolCall`、`ToolResult`、`ToolSpec` | `ToolCall.id` 自动生成 |
+| 推理 | `Plan`、`Reflection` | `Reflection.next_action: "retry"/"revise"/"done"` |
+| 审计 | `TraceEvent` | JSON Lines 写入 `runtime/traces/{session_id}.jsonl` |
+| 解析 | `ParsedOutput` | `parse_response` 的返回结构 |
+| 结果 | `WorkflowResult` | `Workflow.run()` 的返回 |
 
-**`messages` 格式**：标准 OpenAI 格式 —— `List[{"role": "system"|"user"|"assistant", "content": "..."}]`。
-为减少耦合，参数类型只声明为 `List[Mapping[str, Any]]`；模块内另有类型别名 **`ChatMessage`**（等价于 `Mapping[str, Any]`），可按需 `from utils.llm_client import ChatMessage`。调用方既可传裸 `dict`，也可传未来 `core.schema` 里 Pydantic 模型 `model_dump()` 出来的字典。
-
-**关键字参数（`chat` / `stream_chat` 共用）**：
-
-| 参数 | 类型 | 说明 |
-|---|---|---|
-| `model` | `Optional[str]` | 临时覆盖模型名（多模型路由用） |
-| `temperature` | `Optional[float]` | 不传则用 `LLMConfig.temperature` |
-| `max_tokens` | `Optional[int]` | 直传给底层 SDK |
-| `extra` | `Optional[dict]` | 透传给 `chat.completions.create`（如 `top_p`、`stop`） |
-
-### 2.3 调用示例
-
-#### 最简同步调用
-
-```python
-from utils.llm_client import LLMClient
-
-client = LLMClient()                    # 从 .env 读配置
-reply = client.chat(
-    [
-        {"role": "system", "content": "You are a careful Python coder."},
-        {"role": "user", "content": "Write a function that reverses a string."},
-    ]
-)
-print(reply)
-```
-
-#### 流式输出（未来给 UI 做打字机效果）
-
-```python
-client = LLMClient()
-for chunk in client.stream_chat(messages):
-    print(chunk, end="", flush=True)
-```
-
-#### 单轮覆盖参数
-
-```python
-reply = client.chat(
-    messages,
-    model="qwen2.5-coder:14b",   # 这一轮临时换模型
-    temperature=0.0,             # 这一轮要确定性
-    max_tokens=1024,
-    extra={"top_p": 0.9, "stop": ["</file>"]},
-)
-```
-
-#### 自定义配置（测试场景）
-
-```python
-from utils.llm_client import LLMClient, LLMConfig
-
-cfg = LLMConfig(
-    base_url="http://test-host:11434/v1",
-    api_key="ollama",
-    model="tinyllama",
-    timeout_seconds=5.0,
-    max_retries=0,
-    temperature=0.0,
-)
-client = LLMClient(cfg)
-```
-
-### 2.4 重试与错误约定
-
-| 场景 | 行为 |
-|---|---|
-| `APITimeoutError` | 重试，指数退避（1s, 2s, 4s ... 上限 10s） |
-| `APIConnectionError` | 同上 |
-| `RateLimitError` | 同上 |
-| 其他 `APIError`（4xx 等） | **立即抛出，不重试**（无意义） |
-| 超出重试预算 | 抛 `core.exceptions.LLMTimeoutError`，原始异常挂在 `__cause__` 上 |
-
-> 调用方只需 `try / except LLMTimeoutError`，不必关心底层 `openai.*Error`。
+**关键约定**：
+- 业务层失败信号（测试不通过 / 假设被证伪）**不走异常**，靠 `ExecutionResult` 与 `Evidence` 承载，再由 workflow 决定是否升格成 `EvidenceConflict`。
+- `ChatMessage.thought` 在 PHILOSOPHY 模式由 `utils.parser` 强校验，schema 本身不强制。
 
 ---
 
-## 3. `core.exceptions`
-
-整个项目所有自定义异常的根。**业务侧的失败信号（如测试不通过、假设被证伪）不走异常**，而是数据回流（`ExecutionResult` / `Evidence`）。异常只表达两类信号：**可重试** 和 **必须熔断**。
-
-### 3.1 异常树
+## 3. 异常层 `core.exceptions`
 
 ```
 TinyDevinError
-├── RetryableError              ← workflow 可在同一 session 内重试
-│   ├── CodeFormatError         ← 解析不到 <file> / <thought> 块
-│   ├── MissingPathError        ← 代码块缺 path 属性
-│   ├── LLMTimeoutError         ← LLM 重试预算耗尽
-│   └── EvidenceConflict        ← Executor 数据与当前论点冲突
-└── FatalError                  ← workflow 必须立即终止 session
-    ├── SandboxViolation        ← Agent 试图越权（rm -rf / 等）
-    ├── ContainerImageError     ← 基础镜像缺失或构建失败
-    └── ResourceExhausted       ← 容器内存 / GPU / 磁盘超限
+├── RetryableError                ← workflow 同 session 内重试
+│   ├── CodeFormatError           解析失败（含缺 <thought>）
+│   ├── MissingPathError          <file> 缺路径
+│   ├── LLMTimeoutError           LLM 重试预算耗尽
+│   ├── EvidenceConflict          数据 / 单测与论点冲突
+│   ├── ToolError                 工具调用软失败
+│   └── MemoryError               记忆层瞬态故障
+└── FatalError                    ← workflow 直接 FAILED
+    ├── SandboxViolation          越权指令
+    ├── ContainerImageError       基础镜像缺失 / docker 不可用
+    ├── ResourceExhausted         超时 / OOM
+    └── ConfigurationError        必需配置缺失
 ```
 
-### 3.2 上层处理范式
-
-`workflow.py` / `main.py` 推荐统一两个 except 分支：
-
-```python
-from core.exceptions import RetryableError, FatalError
-
-try:
-    do_one_turn()
-except RetryableError as exc:
-    # 把 exc 反馈给下一轮 prompt（"上次解析失败，请按 <file> 标签输出"）
-    feedback_for_next_turn = build_feedback(exc)
-except FatalError as exc:
-    # 关容器、写日志、告知用户
-    session_manager.shutdown()
-    raise
-```
-
-### 3.3 抛异常时的写法约定
-
-所有自定义异常都接受 `details` 参数承载结构化上下文：
-
-```python
-from core.exceptions import CodeFormatError
-
-raise CodeFormatError(
-    "no <file> block found",
-    details={"raw_output": llm_output[:200], "turn": current_turn},
-)
-```
-
-`workflow` 把 `details` 序列化到反馈 prompt 里，比纯字符串消息有用得多。
-
-**`LLMTimeoutError`（由 `LLMClient` 抛出）**：`details` 在实现里通常是**最后一次失败的简短字符串**，原始 `openai` 异常放在 **`__cause__`** 上（见 §2.4）。需要结构化上下文时仍以业务侧自定义异常 + dict `details` 为主。
+上层统一两个 except 分支即可（参见 §8）。
 
 ---
 
-## 4. 跨模块组合范式
+## 4. 认知层
 
-下面是**业务层**未来一定会重复出现的最小调用骨架，可作为 `executor.py` / `workflow.py` 实现时的参考。
+### 4.1 `utils.llm_client`
 
-```python
-import logging
-from utils.llm_client import LLMClient
-from core.exceptions import (
-    CodeFormatError,
-    EvidenceConflict,
-    FatalError,
-    LLMTimeoutError,
-    RetryableError,
-)
+| 接口 | 用途 |
+|---|---|
+| `LLMConfig.from_env()` | 从 `.env` / 环境变量读配置 |
+| `LLMClient(config=None)` | 客户端实例（默认走 Ollama OpenAI 兼容接口） |
+| `client.chat(messages, *, model, temperature, max_tokens, extra)` | 同步对话，自带重试，返回 `str` |
+| `client.stream_chat(...)` | 流式对话，返回 `Iterator[str]` |
 
-logger = logging.getLogger(__name__)
+错误模型：
+- 超时 / 连接 / 限流 → 指数退避后重试，预算耗尽抛 `LLMTimeoutError`。
+- 其他 `APIError`（4xx 等）→ 立即抛，不重试。
 
-
-def run_one_turn(client: LLMClient, messages: list) -> str:
-    """单轮：发 prompt -> 拿文本。失败语义已被 LLMClient 收敛。"""
-    try:
-        return client.chat(messages)
-    except LLMTimeoutError:
-        # 已经是 RetryableError 子类，由 workflow 决定是否再来一轮
-        raise
-
-
-def run_loop(client: LLMClient, initial_messages: list, max_turns: int = 10):
-    messages = list(initial_messages)
-    for turn in range(max_turns):
-        try:
-            reply = run_one_turn(client, messages)
-            # parsed = parser.parse(reply)         # 业务层
-            # result = executor.run(parsed.files)  # 业务层
-            # workflow.detect_conflict(result)     # 业务层
-            return reply
-        except RetryableError as exc:
-            logger.warning("turn %d retryable: %s", turn, exc)
-            messages.append({"role": "user", "content": f"[feedback] {exc}"})
-            continue
-        except FatalError:
-            logger.exception("fatal error, abort session")
-            raise
-    raise LLMTimeoutError(f"exceeded max_turns={max_turns}")
-```
-
----
-
-## 5. 测试基建
-
-`pytest.ini` 已配置：
-
-- `pythonpath = .` — 测试可直接 `from utils.llm_client import LLMClient`，无需安装包
-- `testpaths = tests`
-- `--strict-markers` — 用未声明的 marker 直接报错，避免拼错
-
-跑测试：
-
-```bash
-pytest                    # 全量
-pytest tests/test_llm_client.py -q
-pytest -k "timeout" -v    # 关键字过滤
-```
-
-写 `LLMClient` 的单测时，**不要真的连 Ollama**，应 mock `openai.OpenAI` 或注入一个伪造的 `LLMConfig`。示例：
+### 4.2 `utils.parser`
 
 ```python
-from unittest.mock import MagicMock, patch
-from utils.llm_client import LLMClient, LLMConfig
+from utils.parser import parse_response
+from core.schema import TaskMode
 
-def make_client():
-    cfg = LLMConfig(
-        base_url="http://x", api_key="x", model="x",
-        timeout_seconds=1, max_retries=0, temperature=0,
-    )
-    with patch("utils.llm_client.OpenAI") as fake:
-        client = LLMClient(cfg)
-        client._client = MagicMock()
-    return client
+parsed = parse_response(text, mode=TaskMode.PHILOSOPHY, require_block=True)
+
+parsed.files       # List[FileOperation]
+parsed.thoughts    # List[str]   PHILOSOPHY 必须 ≥ 1，否则抛 CodeFormatError
+parsed.tool_calls  # List[ToolCall]，args 为 JSON dict
+parsed.json_blocks # List[dict]  形如 Plan/Reflection 的 ```json``` 块
 ```
 
----
+支持的块：
 
-## 6. 沙箱基础镜像
-
-`Dockerfile` 构建 `tiny-devin-base:latest`，这是**所有 TaskMode 共享的最小可用镜像**：
-
-```bash
-docker build -t tiny-devin-base:latest .
-```
-
-预装库：`requests / httpx / beautifulsoup4 / lxml / numpy / pandas / matplotlib / scipy / pytest`。
-两类典型脚本（修 bug 用单测、跑分析用统计）开箱即用，业务上若缺包再 `pip install` 动态补漏（参见规范 §5）。
-
-`executor.py` 启动容器时应：
-
-1. 通过 `WORKSPACE_DIR` 环境变量找到宿主机目录
-2. 以 volume 形式挂载到容器 `/workspace`（双向同步约定）
-3. 应用 `CONTAINER_MEMORY_LIMIT` / `CONTAINER_CPU_LIMIT` 配额
-4. 失败时按 §3 的异常分类抛 `ContainerImageError` / `ResourceExhausted` / `SandboxViolation`
-
----
-
-## 7. 待业务层补全的接口位
-
-下列函数 / 类还**没有**实现，但已被 `api.md` 中的范式预设了形状。后续实现时请尽量保持签名稳定：
-
-| 模块 | 接口 | 形状预期 |
+| 块 | 语法 | 落点 |
 |---|---|---|
-| `core.schema` | `TaskMode`, `Evidence`, `ChatMessage`, `FileOperation`, `ExecutionResult` | Pydantic v2 模型，详见 `项目规范.md` §2 |
-| `utils.parser` | `parse(text: str, *, mode: TaskMode) -> ParsedOutput` | 失败抛 `CodeFormatError` / `MissingPathError` |
-| `runtime.executor` | `Executor.run(files: List[FileOperation]) -> ExecutionResult` | 失败抛 `ContainerImageError` / `ResourceExhausted` / `SandboxViolation` |
-| `core.session_manager` | `SessionManager` | 心跳 + 超时清理，单容器单会话 |
-| `core.workflow` | `Workflow.run_until_done(initial_prompt, mode) -> ...` | 遇 **`FatalError`**：立即终止 session；遇 **`EvidenceConflict`**（属 `RetryableError`）：进入反思/修订循环；其它 **`RetryableError`**：带反馈同 session 重试 |
-| `prompt_templates` | `SystemPromptBuilder(role, mode).render() -> str` | 角色 × 模式查表（参见规范 §4.1） |
+| 文件 | `<file path="a.py" action="write">...</file>` | `files` |
+| 文件兼容形式 | ```` ```python\n# file: a.py\n...\n``` ```` | `files` |
+| 思辨 | `<thought>...</thought>` | `thoughts` |
+| 工具 | `<tool name="x">{json args}</tool>`（或 `<![CDATA[...]]>` 包裹） | `tool_calls` |
+| JSON 结构 | ```` ```json\n{...}\n``` ```` | `json_blocks` |
+
+### 4.3 `prompt_templates`
+
+Jinja2 驱动。
+
+```python
+from prompt_templates import SystemPromptBuilder
+from core.schema import AgentRole, TaskMode
+
+system_prompt = SystemPromptBuilder(
+    role=AgentRole.PHILOSOPHER,
+    mode=TaskMode.PHILOSOPHY,
+    tools=tool_registry.list_specs(),
+    extra_ctx={"topic": "epistemology"},
+).render()
+```
+
+支持的角色矩阵：
+
+| Role / Mode | DEVELOPMENT | PHILOSOPHY |
+|---|---|---|
+| `CODER` | 写 / 修代码 | （可用，但语气会偏代码） |
+| `REVIEWER` | 查语法、单测 | 查逻辑谬误、数据证伪 |
+| `PHILOSOPHER` | （可用） | 构建论证 |
+| `INVESTIGATOR` | （可用） | 把假设翻成实证脚本 |
+| `PLANNER` | 输出 `Plan` JSON | 同左 |
+| `REFLECTOR` | 输出 `Reflection` JSON | 同左 |
+
+`.with_tools(tools)` / `.with_context(**kv)` 返回新实例（不可变）。
 
 ---
 
-## 附：当前可独立运行的"最小验证"
+## 5. 执行层
 
-只用基础层就能跑通的 smoke check（前提：本地 Ollama 已起，对应模型已 pull）：
+### 5.1 `runtime.executor`
 
 ```python
-# smoke.py
+from runtime.executor import Executor
+from core.schema import FileOperation
+
+executor = Executor()  # 一次性容器模式
+result = executor.run(
+    files=[FileOperation(file_path="main.py", content="print('hi')")],
+    command=["python", "main.py"],
+    extra_pip=["loguru"],
+    timeout=30,
+)
+result.is_success      # bool
+result.stdout          # str
+result.artifacts       # List[str]  本轮新生成文件
+result.metrics         # {"elapsed_ms": ..., "exit_code": ...}
+```
+
+- 单次模式：每次 `run()` 起一个新容器并自动删除。
+- 长会话模式：被 `SessionManager` 持有一个 `container_name` 时，复用容器。
+- `_apply_files` 写到 `WORKSPACE_DIR`，与容器 `/workspace` volume 双向同步。
+- 命令安全：硬编码黑名单（`rm -rf /` / fork bomb / `mkfs` 等）→ 抛 `SandboxViolation`。
+
+### 5.2 `tools.*` 与 `ToolRegistry`
+
+内置工具：
+
+| 名称 | 类 | 必需参数 | 说明 |
+|---|---|---|---|
+| `file_read` | `FileReadTool` | `path` | 沙箱内读文件，UTF-8 |
+| `file_write` | `FileWriteTool` | `path`, `content` | 沙箱内写文件 |
+| `file_list` | `FileListTool` | — | 列出 workspace 一级目录 |
+| `python_repl` | `PythonReplTool` | `code` | 通过 Executor 运行 Python（需 `.bind_executor()`） |
+| `web_search` | `WebSearchTool` | `query` | DuckDuckGo HTML，无 API key |
+| `rag_query` | `RagQueryTool` | `query` | 长期记忆检索 |
+| `rag_upsert` | `RagUpsertTool` | `texts` | 长期记忆写入 |
+
+注册与调用：
+
+```python
+from tools.registry import ToolRegistry
+from tools.file_io import FileReadTool, FileWriteTool, FileListTool
+from tools.repl import PythonReplTool
+from core.schema import ToolCall
+
+registry = ToolRegistry()
+registry.register(FileReadTool())
+registry.register(FileWriteTool())
+repl = PythonReplTool()
+repl.bind_executor(executor)
+registry.register(repl)
+
+# 一次调用
+result = registry.invoke(ToolCall(name="file_read", args={"path": "main.py"}))
+result.status   # ToolStatus.SUCCESS / FAILED
+result.output   # 工具自定义结构
+```
+
+### 5.3 写一个新工具
+
+```python
+from typing import Any, Dict
+from core.exceptions import ToolError
+from core.schema import ToolSpec
+from tools.base import Tool
+
+class WordCountTool(Tool):
+    spec = ToolSpec(
+        name="word_count",
+        description="Count words in a string.",
+        args_schema={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    )
+
+    def call(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        text = args["text"]
+        if not isinstance(text, str):
+            raise ToolError("text must be a string")
+        return {"count": len(text.split())}
+
+registry.register(WordCountTool())
+```
+
+要点：
+- 必须类级别声明 `spec: ToolSpec`（构造函数声明 `__init_subclass__` 会校验）。
+- 业务失败抛 `ToolError`（→ Retryable），越权抛 `SandboxViolation`（→ Fatal）。
+- 框架自动量耗时、捕获异常、装进 `ToolResult`。
+
+---
+
+## 6. 记忆层
+
+### 6.1 `memory.session_context`
+
+短期工作记忆。
+
+```python
+from memory.session_context import SessionContext, ContextConfig
+from core.schema import ChatMessage, MessageRole
+
+ctx = SessionContext(ContextConfig.from_env())
+ctx.set_summarizer(lambda msgs: client.chat([...]))  # 由 workflow 注入
+ctx.add(ChatMessage(role=MessageRole.USER, content="..."))
+ctx.compress_if_needed()   # 自动调用，超 budget 时压缩中段
+openai_messages = ctx.to_openai()
+```
+
+- Token 计数优先 `tiktoken`，未安装时降级 `len/4`。
+- 压缩策略：保留首条 SYSTEM + 最末 `preserve_recent` 条；中段合并为一条 SYSTEM 摘要。
+- `summarizer` 是 `Callable[[List[ChatMessage]], str]`，由 `main.py` 注入。
+
+### 6.2 `memory.vector_store`
+
+长期经验记忆，ChromaDB 懒加载。
+
+```python
+from memory.vector_store import VectorStore
+
+store = VectorStore()
+ids = store.upsert(
+    texts=["nietzsche on technology", "MVC pattern in Django"],
+    metadatas=[{"topic": "philosophy"}, {"topic": "code"}],
+)
+hits = store.query("post-structuralist views on AI", k=3)
+for h in hits:
+    print(h.id, h.distance, h.text[:80])
+```
+
+- 首次 `upsert` / `query` 才真正 `import chromadb`，导入 `memory.vector_store` 本身零代价。
+- 持久化目录由 `VECTOR_PERSIST_DIR` 控制，默认 `./runtime/vector_store/`（已加入 `.gitignore`）。
+- 任何 chromadb 异常会被规范为 `MemoryError`（Retryable）。
+
+---
+
+## 7. 编排层
+
+### 7.1 `core.session_manager`
+
+```python
+from core.session_manager import SessionManager
+
+with SessionManager() as session:
+    session_id = session.session_id
+    executor = session.executor
+    # ... use executor ...
+    session.heartbeat()       # 每个 turn 调一次，阻止空闲熔断
+# 退出 with 自动 stop（关容器 / 终止心跳线程）
+```
+
+- 单容器单会话（MVP），`session_id = "{prefix}-{uuid8}"`。
+- 后台心跳线程，超 `CONTAINER_IDLE_TIMEOUT_SECONDS` 自动强停。
+
+### 7.2 `core.audit`
+
+JSON Lines 轨迹日志。
+
+```python
+from core.audit import TraceLogger, KIND_PROMPT
+from core.schema import AgentState
+
+trace = TraceLogger(session_id="demo-001")
+trace.log(KIND_PROMPT, {"user": "say hi"}, state=AgentState.IDLE, turn=0)
+trace.close()
+
+# 离线读取
+from core.audit import read_trace
+events = read_trace("runtime/traces/demo-001.jsonl")
+```
+
+字段：`ts / session_id / turn / state / kind / payload`。
+
+`kind` 常量：`KIND_PROMPT`, `KIND_RESPONSE`, `KIND_TOOL_CALL`, `KIND_TOOL_RESULT`, `KIND_EXEC_RESULT`, `KIND_STATE_CHANGE`, `KIND_ERROR`, `KIND_REFLECTION`, `KIND_PLAN`。
+
+### 7.3 `core.workflow`
+
+状态机驱动整个 session。
+
+```python
+from core.workflow import Workflow, WorkflowConfig
+from core.schema import AgentRole, TaskMode
+
+workflow = Workflow(
+    llm=llm_client,
+    tools=tool_registry,
+    context=session_context,
+    trace=trace_logger,
+    mode=TaskMode.DEVELOPMENT,
+    config=WorkflowConfig(max_turns=10, role=AgentRole.CODER),
+)
+result = workflow.run("Implement quick sort and add a unit test.")
+```
+
+状态流：
+
+```
+IDLE → THINKING → ACTING → OBSERVING → REFLECTING → ...
+                                                ↘ DONE / FAILED
+```
+
+行为：
+- 每次状态切换写一条 `KIND_STATE_CHANGE` trace。
+- `THINKING` 调 LLM；`ACTING` 派发工具；`OBSERVING` 把 `ToolResult` 注入上下文；`REFLECTING` 看 LLM 是否给了 `Reflection` JSON（含 `next_action`）。
+- 遇 `RetryableError`：写 trace、构造反馈消息（`[feedback] ...`）、回到 `THINKING`。
+- 遇 `FatalError`：状态 → `FAILED`，trace 关闭，返回 `WorkflowResult(error=...)`。
+- 终止条件三选一：assistant 显式 `[done]` / max_turns / FAILED。
+
+---
+
+## 8. 端到端组装范例
+
+下面是 `main.py` 的内核精简版，可作为自定义 entrypoint 的起点：
+
+```python
+from core.audit import TraceLogger
+from core.schema import AgentRole, TaskMode
+from core.session_manager import SessionManager
+from core.workflow import Workflow, WorkflowConfig
+from memory.session_context import SessionContext
+from tools.file_io import FileReadTool, FileWriteTool, FileListTool
+from tools.repl import PythonReplTool
+from tools.registry import ToolRegistry
 from utils.llm_client import LLMClient
 
-client = LLMClient()
-print(client.chat([{"role": "user", "content": "say hi in 5 words"}]))
+llm = LLMClient()
+
+with SessionManager() as session:
+    trace = TraceLogger(session_id=session.session_id)
+
+    tools = ToolRegistry()
+    tools.register(FileReadTool())
+    tools.register(FileWriteTool())
+    tools.register(FileListTool())
+    repl = PythonReplTool()
+    repl.bind_executor(session.executor)
+    tools.register(repl)
+
+    context = SessionContext()
+    context.set_summarizer(
+        lambda msgs: llm.chat(
+            [
+                {"role": "system", "content": "Condense the conversation."},
+                {"role": "user", "content": "\n\n".join(m.content for m in msgs)},
+            ]
+        )
+    )
+
+    workflow = Workflow(
+        llm=llm, tools=tools, context=context, trace=trace,
+        mode=TaskMode.DEVELOPMENT,
+        config=WorkflowConfig(max_turns=8, role=AgentRole.CODER),
+    )
+    result = workflow.run("Write quick_sort.py and unit-test it with pytest.")
+    print(result.model_dump_json(indent=2))
+    trace.close()
 ```
 
-```bash
-python smoke.py
-```
+切换模式：把 `mode=TaskMode.PHILOSOPHY`、`role=AgentRole.PHILOSOPHER`，工具集换上 `WebSearchTool` 与 `RagQueryTool` 即可，**workflow 本身不动**。
 
-如果能打印一段文本，说明配置 / 网络 / 异常封装一切正常，可以放心进入业务层开发。
+---
+
+## 9. 测试基建
+
+- `pytest.ini`：`pythonpath = .`、`testpaths = tests`、`--strict-markers`。
+- 跑 `pytest`。
+- 写 `LLMClient` 测试时 mock `openai.OpenAI`；写 `Executor` 测试时 mock `docker.from_env`。
+- `core.audit.read_trace(path)` 帮你在测试里回读 JSONL 断言行为。
+
+---
+
+## 附 A：模块依赖图（人脑友好版）
+
+```
+main.py
+  ├── core.session_manager  ── runtime.executor
+  ├── core.audit            ── core.schema
+  ├── core.workflow         ── utils.llm_client
+  │                         ── utils.parser
+  │                         ── prompt_templates ── core.schema
+  │                         ── memory.session_context
+  │                         ── tools.registry   ── tools.base
+  │                                              ├── tools.file_io
+  │                                              ├── tools.search
+  │                                              ├── tools.repl    ── runtime.executor
+  │                                              └── tools.rag     ── memory.vector_store
+  └── tools.* / memory.*
+
+core.exceptions  ← 被所有层 import
+core.schema      ← 被所有层 import
+```
