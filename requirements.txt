@@ -1,0 +1,33 @@
+# =============== Core ===============
+# Data validation
+pydantic>=2.5,<3
+
+# LLM client (Ollama via OpenAI-compatible API)
+openai>=1.30,<2
+
+# Container orchestration
+docker>=7.0,<8
+
+# Config loading
+python-dotenv>=1.0,<2
+
+# =============== Cognitive Layer ===============
+# Prompt template engine
+jinja2>=3.1,<4
+
+# Token counting (graceful fallback to char/4 if missing)
+tiktoken>=0.7,<1
+
+# =============== Memory Layer ===============
+# Long-term vector storage
+chromadb>=0.5,<1
+
+# =============== Tools ===============
+# HTTP client used by search / scraping tools
+httpx>=0.27,<1
+
+# HTML parsing for search results
+beautifulsoup4>=4.12,<5
+
+# =============== Testing ===============
+pytest>=8.0,<9
