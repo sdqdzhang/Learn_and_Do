@@ -3,6 +3,12 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   plugins: [react()],
+  server: {
+    proxy: {
+      "/ws": { target: "http://127.0.0.1:8765", ws: true },
+      "/api": { target: "http://127.0.0.1:8765" },
+    },
+  },
   test: {
     environment: "node",
     include: ["src/**/*.test.ts"],

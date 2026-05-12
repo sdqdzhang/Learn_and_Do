@@ -33,14 +33,11 @@ from core.schema import AgentRole, TaskMode
 from core.session_manager import SessionManager
 from core.workflow import Workflow, WorkflowConfig
 from memory.session_context import SessionContext
-from memory.vector_store import VectorStore
 from runtime.stream_tunnel import default_tunnel
-from tools.file_io import FileListTool, FileReadTool, FileWriteTool
-from tools.rag import RagQueryTool, RagUpsertTool
 from tools.registry import ToolRegistry
-from tools.repl import PythonReplTool
-from tools.search import WebSearchTool
 from utils.llm_client import LLMClient
+
+from bootstrap import build_summarizer, register_tools
 
 
 def _setup_logging() -> None:
@@ -49,55 +46,6 @@ def _setup_logging() -> None:
         level=getattr(logging, level, logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-
-
-def _build_summarizer(client: LLMClient):
-    """返回一个把 List[ChatMessage] 浓缩成单条文本的函数。
-
-    :class:`SessionContext` 在 token 预算溢出时会调用它。
-    """
-
-    def summarize(messages) -> str:
-        prompt = (
-            "请把下面这段对话压缩成一份简洁的摘要。"
-            "必须完整保留：每一个已做出的决定、每一个出现过的冲突、"
-            "以及每一个被创建或修改的文件。"
-            "请省略问候语和与任务无关的寒暄。"
-            "输出纯文本叙述，控制在 300 字以内，使用中文。"
-        )
-        flat = "\n\n".join(f"[{m.role.value}] {m.content}" for m in messages)
-        return client.chat(
-            [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": flat},
-            ]
-        )
-
-    return summarize
-
-
-def _register_tools(
-    registry: ToolRegistry,
-    *,
-    executor,
-    enable_search: bool,
-    enable_rag: bool,
-) -> None:
-    registry.register(FileReadTool())
-    registry.register(FileWriteTool())
-    registry.register(FileListTool())
-
-    repl = PythonReplTool()
-    repl.bind_executor(executor)
-    registry.register(repl)
-
-    if enable_search:
-        registry.register(WebSearchTool())
-
-    if enable_rag:
-        store = VectorStore()
-        registry.register(RagQueryTool(store))
-        registry.register(RagUpsertTool(store))
 
 
 def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
@@ -158,10 +106,10 @@ def main(argv: Optional[list] = None) -> int:
         return 2
 
     context = SessionContext()
-    context.set_summarizer(_build_summarizer(llm))
+    context.set_summarizer(build_summarizer(llm))
 
     tools = ToolRegistry()
-    _register_tools(
+    register_tools(
         tools,
         executor=session.executor,
         enable_search=not args.no_search,

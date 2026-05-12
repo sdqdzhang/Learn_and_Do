@@ -13,7 +13,7 @@ import os
 import threading
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 from core.schema import AgentState, TraceEvent
 
@@ -49,6 +49,7 @@ class TraceLogger:
         *,
         context: Optional["SessionContext"] = None,
         enable_context_snapshots: bool = True,
+        on_event: Optional[Callable[[TraceEvent], None]] = None,
     ) -> None:
         self._session_id = session_id
         directory = Path(log_dir or os.getenv("TRACE_DIR", "./runtime/traces")).resolve()
@@ -59,6 +60,7 @@ class TraceLogger:
         self._context_ref = context
         self._enable_snapshots = enable_context_snapshots
         self._runtime_seq = 0
+        self._on_event = on_event
 
     def attach_context(self, context: "SessionContext") -> None:
         """在 ``SessionContext`` 创建之后绑定，用于后续自动快照。"""
@@ -116,6 +118,11 @@ class TraceLogger:
         with self._lock:
             self._fh.write(line + "\n")
             self._fh.flush()
+        if self._on_event is not None:
+            try:
+                self._on_event(event)
+            except Exception:  # noqa: BLE001
+                logger.exception("TraceLogger.on_event 回调失败")
         return event
 
     def log_event(self, event: TraceEvent) -> None:
