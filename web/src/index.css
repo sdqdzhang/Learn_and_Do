@@ -8,3 +8,29 @@ body,
   height: 100%;
   margin: 0;
 }
+
+/*
+  React Flow 为内置 output 节点定义了 .react-flow__node-output（白底、固定宽度等）。
+  本项目的工具 stdout 节点复用了 type="output"，会套上同一 class，必须把默认壳层清掉，
+  否则会出现整块浅色矩形盖住自定义深色卡片。
+*/
+.react-flow .react-flow__node-output {
+  background-color: transparent !important;
+  padding: 0 !important;
+  border: none !important;
+  width: auto !important;
+  min-width: 0 !important;
+  color: inherit !important;
+  text-align: left !important;
+  box-shadow: none !important;
+}
+
+.react-flow .react-flow__node-output.selectable:hover {
+  box-shadow: none !important;
+}
+
+.react-flow .react-flow__node-output.selectable.selected,
+.react-flow .react-flow__node-output.selectable:focus,
+.react-flow .react-flow__node-output.selectable:focus-visible {
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.35) !important;
+}

@@ -37,7 +37,17 @@ export type ExecutionNodeData = {
   rawEvent: TraceEvent;
 };
 
+/** 工具 stdout / stderr 或与后端对齐的结构化 output 摘要（画布专用）。 */
+export type OutputNodeData = {
+  callId: string;
+  toolName: string;
+  stdout: string;
+  stderr: string;
+  summary: string;
+  rawEvent: TraceEvent;
+};
+
 export type ChainTip = {
   nodeId: string;
-  variant: "cognitive" | "execution";
+  variant: "cognitive" | "execution" | "output";
 };

@@ -1,11 +1,19 @@
 import type { Edge, Node } from "reactflow";
 import { create } from "zustand";
-import type { ChainTip, CognitiveNodeData, ExecutionNodeData, TraceEvent } from "../types/trace";
+import type {
+  ChainTip,
+  CognitiveNodeData,
+  ExecutionNodeData,
+  OutputNodeData,
+  TraceEvent,
+} from "../types/trace";
 import { edgePaint } from "../utils/edgeAppearance";
 import { extractThoughts, normalizeUsage } from "../utils/thoughtAdapter";
+import { extractToolOutputParts } from "../utils/toolOutput";
 
 const COG_X = 48;
 const EXEC_X = 560;
+const OUTPUT_X = 920;
 const ROW_GAP = 168;
 
 function mapToolStatus(s: unknown): ExecutionNodeData["status"] {
@@ -22,6 +30,12 @@ function edgeHandles(
   if (prev === "cognitive" && next === "execution") {
     return { sourceHandle: "out-r", targetHandle: "in-l" };
   }
+  if (prev === "execution" && next === "output") {
+    return { sourceHandle: "out-r", targetHandle: "in-l" };
+  }
+  if (prev === "output" && next === "cognitive") {
+    return { sourceHandle: "out-l", targetHandle: "in-r" };
+  }
   if (prev === "execution" && next === "cognitive") {
     return { sourceHandle: "out-l", targetHandle: "in-r" };
   }
@@ -31,8 +45,89 @@ function edgeHandles(
   return { sourceHandle: "out-r", targetHandle: "in-l" };
 }
 
+function attachOutputAfterExec(
+  nodes: Node<CognitiveNodeData | ExecutionNodeData | OutputNodeData>[],
+  edges: Edge[],
+  edgeSeq: number,
+  execId: string,
+  event: TraceEvent,
+): {
+  nodes: Node<CognitiveNodeData | ExecutionNodeData | OutputNodeData>[];
+  edges: Edge[];
+  edgeSeq: number;
+  lastChain: ChainTip;
+} {
+  const callId = String(event.payload.id ?? "");
+  const outId = `out-${callId}`;
+  const execNode = nodes.find((n) => n.id === execId);
+  if (!execNode) {
+    return {
+      nodes,
+      edges,
+      edgeSeq,
+      lastChain: { nodeId: execId, variant: "execution" },
+    };
+  }
+
+  const parts = extractToolOutputParts(event.payload);
+  const toolName = String(event.payload.name ?? "unknown_tool");
+  const outData: OutputNodeData = {
+    callId,
+    toolName,
+    ...parts,
+    rawEvent: event,
+  };
+
+  const existing = nodes.find((n) => n.id === outId);
+  if (existing && existing.type === "output") {
+    const nextNodes = nodes.map((n) =>
+      n.id === outId ? { ...n, data: outData } : n,
+    );
+    return {
+      nodes: nextNodes,
+      edges,
+      edgeSeq,
+      lastChain: { nodeId: outId, variant: "output" },
+    };
+  }
+
+  const outNode: Node<OutputNodeData> = {
+    id: outId,
+    type: "output",
+    position: { x: OUTPUT_X, y: execNode.position.y },
+    data: outData,
+  };
+
+  let nextEdges = [...edges];
+  let nextSeq = edgeSeq;
+  const hasEdge = nextEdges.some((e) => e.source === execId && e.target === outId);
+  if (!hasEdge) {
+    nextSeq += 1;
+    const { sourceHandle, targetHandle } = edgeHandles("execution", "output");
+    const paint = edgePaint(edges.length);
+    nextEdges.push({
+      id: `e-${nextSeq}`,
+      source: execId,
+      target: outId,
+      type: "dataFlow",
+      animated: false,
+      sourceHandle,
+      targetHandle,
+      style: { stroke: paint.stroke },
+      data: { curvature: paint.curvature },
+    });
+  }
+
+  return {
+    nodes: [...nodes, outNode],
+    edges: nextEdges,
+    edgeSeq: nextSeq,
+    lastChain: { nodeId: outId, variant: "output" },
+  };
+}
+
 type TraceStore = {
-  nodes: Node<CognitiveNodeData | ExecutionNodeData>[];
+  nodes: Node<CognitiveNodeData | ExecutionNodeData | OutputNodeData>[];
   edges: Edge[];
   lastChain: ChainTip | null;
   cognitiveRow: number;
@@ -78,7 +173,9 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
     const raw =
       n.type === "cognitive"
         ? (n.data as CognitiveNodeData).rawEvent
-        : (n.data as ExecutionNodeData).rawEvent;
+        : n.type === "output"
+          ? (n.data as OutputNodeData).rawEvent
+          : (n.data as ExecutionNodeData).rawEvent;
     set({ selectedEvent: raw });
   },
 
@@ -224,11 +321,13 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
               data: { curvature: paint.curvature },
             });
           }
+          const baseNodes = [...s.nodes, node];
+          const attached = attachOutputAfterExec(baseNodes, edges, edgeSeq, id, event);
           return {
-            nodes: [...s.nodes, node],
-            edges,
-            edgeSeq,
-            lastChain: { nodeId: id, variant: "execution" },
+            nodes: attached.nodes,
+            edges: attached.edges,
+            edgeSeq: attached.edgeSeq,
+            lastChain: attached.lastChain,
             executionRow: row + 1,
           };
         }
@@ -246,7 +345,13 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
             } satisfies ExecutionNodeData,
           };
         });
-        return { nodes: nextNodes };
+        const attached = attachOutputAfterExec(nextNodes, s.edges, s.edgeSeq, id, event);
+        return {
+          nodes: attached.nodes,
+          edges: attached.edges,
+          edgeSeq: attached.edgeSeq,
+          lastChain: attached.lastChain,
+        };
       });
     }
   },

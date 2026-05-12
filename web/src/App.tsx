@@ -15,12 +15,13 @@ import "reactflow/dist/style.css";
 import { DataFlowEdge } from "./components/edges/DataFlowEdge";
 import CognitiveNode from "./components/nodes/CognitiveNode";
 import ExecutionNode from "./components/nodes/ExecutionNode";
+import OutputNode from "./components/nodes/OutputNode";
 import sampleTrace from "./mocks/sample_trace.jsonl?raw";
 import { useTraceStore } from "./store/useTraceStore";
 import { ingestTraceEvent, ingestTraceJsonlLine, resetTraceView, selectTraceNode } from "./trace";
 import type { TraceEvent } from "./types/trace";
 
-const nodeTypes = { cognitive: CognitiveNode, execution: ExecutionNode };
+const nodeTypes = { cognitive: CognitiveNode, execution: ExecutionNode, output: OutputNode };
 const edgeTypes = { dataFlow: DataFlowEdge };
 
 function wsSessionUrl(): string {
@@ -36,7 +37,7 @@ export default function App() {
   const [prompt, setPrompt] = useState("");
   const [mode, setMode] = useState("development");
   const [role, setRole] = useState("coder");
-  const [interventionSec, setInterventionSec] = useState(120);
+  const [interventionSec, setInterventionSec] = useState(0);
   const [sessionStatus, setSessionStatus] = useState<"idle" | "running" | "done" | "error">("idle");
   const [statusNote, setStatusNote] = useState("");
   const [intervention, setIntervention] = useState<{ open: boolean; phase: string }>({
@@ -243,7 +244,11 @@ export default function App() {
             value={interventionSec}
             onChange={(e) => setInterventionSec(Number(e.target.value))}
             className="w-20 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs"
+            title="填 0 关闭：不会在反思前后暂停等你输入（除非服务端 .env 另行开启）。"
           />
+          <span className="mt-0.5 max-w-[14rem] text-[9px] leading-tight text-slate-600">
+            0 = 关闭弹窗；大于 0 时每轮反思后会暂停最多这么多秒等待「上帝指令」。
+          </span>
         </label>
         <button
           type="button"
@@ -304,7 +309,9 @@ export default function App() {
               pannable
               className="!bg-slate-900/95 !border !border-slate-700"
               maskColor="rgba(15,23,42,0.85)"
-              nodeColor={(n) => (n.type === "cognitive" ? "#475569" : "#0f766e")}
+              nodeColor={(n) =>
+                n.type === "cognitive" ? "#475569" : n.type === "output" ? "#0369a1" : "#0f766e"
+              }
             />
           </ReactFlow>
           <header className="pointer-events-none absolute left-4 top-3 z-10 rounded-md border border-slate-700/80 bg-slate-900/80 px-3 py-2 text-xs text-slate-300 backdrop-blur">

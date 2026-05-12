@@ -4,9 +4,26 @@ import { formatUsageLine } from "../../utils/thoughtAdapter";
 
 type Props = { data: CognitiveNodeData };
 
+const BARE_DONE = /^\[(完成|done)\]\s*$/i;
+
 export default function CognitiveNode({ data }: Props) {
-  const { thoughts, usage } = data;
-  const lines = thoughts.length > 0 ? thoughts : ["（无结构化 thought，已回退展示）"];
+  const { thoughts, usage, contentFallback } = data;
+  const trimmed = contentFallback.trim();
+  const lines =
+    thoughts.length > 0
+      ? thoughts
+      : trimmed
+        ? [
+            trimmed.length > 400 ? `${trimmed.slice(0, 400)}…` : trimmed,
+            ...(BARE_DONE.test(trimmed)
+              ? [
+                  "（终止标记：模型声明本 session 可结束；若本轮未触发工具，workflow 会直接 DONE）",
+                ]
+              : []),
+          ]
+        : [
+            "（本轮 assistant 正文为空且无结构化 thought；常见于解析失败后重试瞬间的空 completion；完整载荷见侧栏）",
+          ];
 
   return (
     <div className="w-[300px] rounded-lg border-2 border-slate-600 bg-gradient-to-br from-slate-900/95 via-slate-800/95 to-slate-900/90 px-3 py-2.5 text-slate-100 shadow-lg shadow-slate-950/40">

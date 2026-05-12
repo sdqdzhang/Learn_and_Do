@@ -6,7 +6,7 @@ import scenario from "./sample_trace.jsonl?raw";
 
 /**
  * 剧本：异步爬虫 OOM + 状态机死锁 —— 见 sample_trace.jsonl 内注释性 phase 标记。
- * 回放后画布应为链式 知↔行（4 认知节点 + 5 执行节点 + 8 条边）。
+ * 回放后画布应为链式 知→行→输出（4 认知 + 5 执行 + 5 输出 + 13 条边）。
  */
 describe("sample_trace 爬虫修复剧本", () => {
   beforeEach(() => {
@@ -19,11 +19,13 @@ describe("sample_trace 爬虫修复剧本", () => {
 
     const cognitive = nodes.filter((n) => n.type === "cognitive");
     const execution = nodes.filter((n) => n.type === "execution");
+    const outputs = nodes.filter((n) => n.type === "output");
 
     expect(cognitive).toHaveLength(4);
     expect(execution).toHaveLength(5);
-    expect(nodes).toHaveLength(9);
-    expect(edges).toHaveLength(8);
+    expect(outputs).toHaveLength(5);
+    expect(nodes).toHaveLength(14);
+    expect(edges).toHaveLength(13);
   });
 
   it("含 OOM 失败与 pytest 全绿", () => {
