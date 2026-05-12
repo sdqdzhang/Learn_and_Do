@@ -144,6 +144,21 @@ class SessionContext:
     def reset(self) -> None:
         self._messages.clear()
 
+    def export_snapshot_dict(self) -> Dict[str, Any]:
+        """导出可 JSON 序列化快照，供 :class:`core.schema.TraceEvent` 嵌入。"""
+        return {
+            "version": 1,
+            "messages": [m.model_dump(mode="json") for m in self._messages],
+        }
+
+    def replace_from_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        """用快照覆盖当前消息列表（用于时间旅行恢复）。"""
+        raw = snapshot.get("messages") if isinstance(snapshot, dict) else None
+        if not isinstance(raw, list):
+            self._messages.clear()
+            return
+        self._messages = [ChatMessage.model_validate(m) for m in raw]
+
     # ------------------- 内部实现 ------------------- #
 
     def _compact_once(self) -> bool:

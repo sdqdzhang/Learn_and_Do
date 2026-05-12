@@ -1,3 +1,6 @@
-"""Sandbox runtime: executor and workspace sync (exports added when modules are implemented)."""
+"""Sandbox runtime：Docker 执行器、TTY 隧道骨架。"""
 
-__all__: list[str] = []
+from .executor import Executor, ExecutorConfig
+from .stream_tunnel import StreamTunnel, TunnelEndpoint, default_tunnel
+
+__all__ = ["Executor", "ExecutorConfig", "StreamTunnel", "TunnelEndpoint", "default_tunnel"]

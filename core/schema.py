@@ -7,12 +7,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 import uuid
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # --------------------------------------------------------------------------- #
@@ -55,6 +57,7 @@ class AgentState(str, Enum):
     ACTING = "acting"
     OBSERVING = "observing"
     REFLECTING = "reflecting"
+    INTERVENTION = "intervention"
     DONE = "done"
     FAILED = "failed"
 
@@ -66,6 +69,8 @@ class AgentRole(str, Enum):
     INVESTIGATOR = "investigator"
     PLANNER = "planner"
     REFLECTOR = "reflector"
+    AUDITOR = "auditor"
+    CHALLENGER = "challenger"
 
 
 # --------------------------------------------------------------------------- #
@@ -195,17 +200,59 @@ class Reflection(BaseModel):
     next_action: ReflectionDecision
 
 
+class RoleReflection(BaseModel):
+    """单角色在一次多视角反思中的结论（用于 Multi-Agent Reflection）。"""
+
+    role: AgentRole
+    observations: str = ""
+    next_action: ReflectionDecision
+    raw_block: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MultiReflectionBundle(BaseModel):
+    """同一 Turn 内多角色反思结果的合并载体。"""
+
+    items: List[RoleReflection] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------------- #
 # 轨迹事件（写入审计日志的一行）
 # --------------------------------------------------------------------------- #
 
 class TraceEvent(BaseModel):
+    """一条可审计、可回放的状态化轨迹事件。
+
+    ``event_id`` 用于时间旅行与前端锚点；``runtime_state_id`` 单调标识
+    「运行时拍快照」次序；``context_snapshot`` 可选地嵌入
+    :class:`memory.session_context.SessionContext` 的可逆快照。
+    """
+
     ts: float = Field(default_factory=time.time)
+    event_id: Optional[str] = None
+    runtime_state_id: Optional[str] = None
     session_id: str
     turn: int
     state: AgentState
     kind: str
     payload: Dict[str, Any] = Field(default_factory=dict)
+    context_snapshot: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="SessionContext 快照；用于按 event_id 冷恢复内存",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_trace_ids(cls, data: Any) -> Any:
+        """兼容旧版 JSONL：无 event_id / runtime_state_id 时生成稳定占位。"""
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        if not out.get("event_id"):
+            blob = json.dumps(out, sort_keys=True, default=str)
+            out["event_id"] = "ev-" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+        if not out.get("runtime_state_id"):
+            out["runtime_state_id"] = "rs-legacy"
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -245,7 +292,7 @@ __all__ = [
     # 模型
     "ChatMessage", "FileOperation", "Evidence", "ExecutionResult",
     "ToolCall", "ToolResult", "ToolSpec",
-    "Plan", "Reflection", "TraceEvent",
+    "Plan", "Reflection", "RoleReflection", "MultiReflectionBundle", "TraceEvent",
     "ParsedOutput", "WorkflowResult",
     # 类型别名
     "ReflectionDecision",

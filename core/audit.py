@@ -1,12 +1,8 @@
 """JSON Lines 轨迹日志。
 
 每个 session 写一个文件：``runtime/traces/{session_id}.jsonl``。每一行都是
-一条 ``TraceEvent`` 的 JSON 序列化结果。格式刻意保持简单 —— 扁平、追加、
-按行分隔 —— 这样下游工具（jq、pandas、BI 面板）可以零定制地消费。
-
-为什么不直接用标准库 ``logging``？因为轨迹事件天生是结构化的（状态机切换、
-prompt、工具输入输出），如果硬塞进自由文本日志，每次读取都得再做一遍反向
-解析。我们把它们保留为结构化数据。
+一条 ``TraceEvent`` 的序列化结果；V1.4+ 在每条事件中嵌入可选的
+``context_snapshot`` 与单调 ``runtime_state_id``，以支持时间旅行恢复。
 """
 
 from __future__ import annotations
@@ -15,10 +11,14 @@ import json
 import logging
 import os
 import threading
+import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from core.schema import AgentState, TraceEvent
+
+if TYPE_CHECKING:
+    from memory.session_context import SessionContext
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,9 @@ KIND_STATE_CHANGE = "state_change"
 KIND_ERROR = "error"
 KIND_REFLECTION = "reflection"
 KIND_PLAN = "plan"
+KIND_INTERVENTION_SUSPEND = "intervention_suspend"
+KIND_HUMAN_OVERRIDE = "human_override"
+KIND_MULTI_REFLECTION = "multi_reflection"
 
 
 class TraceLogger:
@@ -43,6 +46,9 @@ class TraceLogger:
         self,
         session_id: str,
         log_dir: Optional[str] = None,
+        *,
+        context: Optional["SessionContext"] = None,
+        enable_context_snapshots: bool = True,
     ) -> None:
         self._session_id = session_id
         directory = Path(log_dir or os.getenv("TRACE_DIR", "./runtime/traces")).resolve()
@@ -50,6 +56,13 @@ class TraceLogger:
         self._path = directory / f"{session_id}.jsonl"
         self._lock = threading.Lock()
         self._fh = self._path.open("a", encoding="utf-8")
+        self._context_ref = context
+        self._enable_snapshots = enable_context_snapshots
+        self._runtime_seq = 0
+
+    def attach_context(self, context: "SessionContext") -> None:
+        """在 ``SessionContext`` 创建之后绑定，用于后续自动快照。"""
+        self._context_ref = context
 
     # ------------------- 属性 ------------------- #
 
@@ -63,6 +76,22 @@ class TraceLogger:
 
     # ------------------- 写入 ------------------- #
 
+    def _next_runtime_state_id(self) -> str:
+        self._runtime_seq += 1
+        return f"rs-{self._runtime_seq:06d}"
+
+    def _maybe_snapshot(self, context: Optional["SessionContext"]) -> Optional[Dict[str, Any]]:
+        if not self._enable_snapshots:
+            return None
+        ctx = context if context is not None else self._context_ref
+        if ctx is None:
+            return None
+        try:
+            return ctx.export_snapshot_dict()
+        except Exception:  # noqa: BLE001
+            logger.exception("导出 SessionContext 快照失败")
+            return None
+
     def log(
         self,
         kind: str,
@@ -70,18 +99,24 @@ class TraceLogger:
         *,
         state: AgentState,
         turn: int,
-    ) -> None:
+        context: Optional["SessionContext"] = None,
+    ) -> TraceEvent:
+        """写入一条轨迹并返回事件对象（含 ``event_id`` / 快照）。"""
         event = TraceEvent(
+            event_id=f"ev-{uuid.uuid4().hex[:12]}",
+            runtime_state_id=self._next_runtime_state_id(),
             session_id=self._session_id,
             turn=turn,
             state=state,
             kind=kind,
             payload=payload,
+            context_snapshot=self._maybe_snapshot(context),
         )
         line = event.model_dump_json()
         with self._lock:
             self._fh.write(line + "\n")
             self._fh.flush()
+        return event
 
     def log_event(self, event: TraceEvent) -> None:
         line = event.model_dump_json()
@@ -117,6 +152,7 @@ class TraceLogger:
 # 读取辅助函数（方便测试与离线回放）
 # --------------------------------------------------------------------------- #
 
+
 def read_trace(path: str) -> list[TraceEvent]:
     """把一个 JSONL 轨迹文件读成 :class:`TraceEvent` 列表。"""
     events: list[TraceEvent] = []
@@ -142,4 +178,7 @@ __all__ = [
     "KIND_ERROR",
     "KIND_REFLECTION",
     "KIND_PLAN",
+    "KIND_INTERVENTION_SUSPEND",
+    "KIND_HUMAN_OVERRIDE",
+    "KIND_MULTI_REFLECTION",
 ]

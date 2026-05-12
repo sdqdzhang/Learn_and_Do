@@ -118,6 +118,10 @@ class SessionManager:
             self._stop_flag.set()
             if self._executor is not None:
                 try:
+                    self._executor.teardown_persistent_container()
+                except Exception:  # noqa: BLE001
+                    logger.exception("清理持久化容器失败")
+                try:
                     self._executor.close()
                 except Exception:  # noqa: BLE001
                     logger.exception("executor 关闭失败")

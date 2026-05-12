@@ -23,11 +23,14 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import FrozenSet, Optional, Tuple, cast
 
 from core.audit import (
     KIND_ERROR,
+    KIND_HUMAN_OVERRIDE,
+    KIND_INTERVENTION_SUSPEND,
+    KIND_MULTI_REFLECTION,
     KIND_PROMPT,
     KIND_REFLECTION,
     KIND_RESPONSE,
@@ -44,12 +47,16 @@ from core.exceptions import (
     RetryableError,
     TinyDevinError,
 )
+from core.intervention import InterventionChannel
 from core.schema import (
     AgentRole,
     AgentState,
     ChatMessage,
     MessageRole,
+    MultiReflectionBundle,
     ParsedOutput,
+    ReflectionDecision,
+    RoleReflection,
     TaskMode,
     ToolStatus,
     WorkflowResult,
@@ -83,12 +90,35 @@ _DONE_MARKERS = (
 class WorkflowConfig:
     max_turns: int = 10
     role: AgentRole = AgentRole.CODER
+    intervention_enabled: bool = False
+    intervention_timeout_s: float = 0.0
+    sensitive_tool_names: FrozenSet[str] = field(default_factory=frozenset)
+    multi_reflection_roles: Tuple[AgentRole, ...] = field(default_factory=tuple)
 
     @classmethod
     def from_env(cls, *, role: Optional[AgentRole] = None) -> "WorkflowConfig":
+        raw_multi = os.getenv("WORKFLOW_MULTI_REFLECTION_ROLES", "").strip()
+        multi: list[AgentRole] = []
+        if raw_multi:
+            for part in raw_multi.split(","):
+                p = part.strip()
+                if not p:
+                    continue
+                try:
+                    multi.append(AgentRole(p))
+                except ValueError:
+                    continue
+        sens_raw = os.getenv("WORKFLOW_SENSITIVE_TOOLS", "").strip()
+        sensitive = frozenset(t.strip() for t in sens_raw.split(",") if t.strip())
+        iv = os.getenv("WORKFLOW_INTERVENTION_ENABLED", "").lower() in ("1", "true", "yes")
+        iv_to = float(os.getenv("WORKFLOW_INTERVENTION_TIMEOUT_S", "0"))
         return cls(
             max_turns=int(os.getenv("WORKFLOW_MAX_TURNS", "10")),
             role=role or AgentRole.CODER,
+            intervention_enabled=iv,
+            intervention_timeout_s=iv_to,
+            sensitive_tool_names=sensitive,
+            multi_reflection_roles=tuple(multi),
         )
 
 
@@ -106,6 +136,7 @@ class Workflow:
         trace: TraceLogger,
         mode: TaskMode,
         config: Optional[WorkflowConfig] = None,
+        intervention: Optional[InterventionChannel] = None,
     ) -> None:
         self._llm = llm
         self._tools = tools
@@ -113,6 +144,7 @@ class Workflow:
         self._trace = trace
         self._mode = mode
         self._config = config or WorkflowConfig.from_env()
+        self._intervention = intervention
         self._state = AgentState.IDLE
         self._turn = 0
 
@@ -180,16 +212,26 @@ class Workflow:
             {"user": user_prompt, "role": self._config.role.value, "mode": self._mode.value},
             state=self._state,
             turn=self._turn,
+            context=self._context,
         )
 
     def _think(self) -> str:
         self._transition(AgentState.THINKING)
         try:
-            reply = self._llm.chat(self._context.to_openai())
+            reply, usage = self._llm.chat_with_usage(self._context.to_openai())
         except LLMTimeoutError:
             raise
+        parsed = parse_response(reply, mode=self._mode, require_block=False)
         self._trace.log(
-            KIND_RESPONSE, {"content": reply}, state=self._state, turn=self._turn
+            KIND_RESPONSE,
+            {
+                "content": reply,
+                "thoughts": parsed.thoughts,
+                "usage": usage,
+            },
+            state=self._state,
+            turn=self._turn,
+            context=self._context,
         )
         self._context.add(ChatMessage(role=MessageRole.ASSISTANT, content=reply))
         return reply
@@ -209,11 +251,14 @@ class Workflow:
         self._transition(AgentState.ACTING)
         results = []
         for call in parsed.tool_calls:
+            if call.name in self._config.sensitive_tool_names:
+                self._maybe_human_intervention(phase=f"pre_tool:{call.name}")
             self._trace.log(
                 KIND_TOOL_CALL,
                 {"name": call.name, "args": call.args, "id": call.id},
                 state=self._state,
                 turn=self._turn,
+                context=self._context,
             )
             result = self._tools.invoke(call)
             self._trace.log(
@@ -227,6 +272,7 @@ class Workflow:
                 },
                 state=self._state,
                 turn=self._turn,
+                context=self._context,
             )
             results.append(result)
 
@@ -248,18 +294,27 @@ class Workflow:
     def _reflect(self, parsed: ParsedOutput, acted: bool) -> None:
         self._transition(AgentState.REFLECTING)
 
-        # 在 assistant 输出里找符合 Reflection 形状的 JSON 块；如果有，
-        # 按 `next_action` 决定流向。否则默认行为：
-        #   - acted=True  -> 继续下一轮
-        #   - acted=False -> 继续下一轮（LLM 可能还需要更多轮次）
-        decision = None
+        decision: Optional[str] = None
+        reflection_block: Optional[dict] = None
         for block in parsed.json_blocks:
             if "next_action" in block:
                 decision = str(block.get("next_action", "")).lower().strip()
+                reflection_block = block
                 self._trace.log(
-                    KIND_REFLECTION, block, state=self._state, turn=self._turn
+                    KIND_REFLECTION,
+                    block,
+                    state=self._state,
+                    turn=self._turn,
+                    context=self._context,
                 )
                 break
+
+        if self._config.multi_reflection_roles:
+            decision = self._merge_multi_reflection(decision, reflection_block, parsed, acted)
+
+        override = self._maybe_human_intervention(phase="post_reflect")
+        if override is not None:
+            decision = override
 
         if decision == "done":
             self._state = AgentState.DONE
@@ -273,11 +328,119 @@ class Workflow:
             )
             return
         if decision == "retry":
-            # 保持当前计划，进入下一轮。
             return
-
-        # 未显式给出反思决定时，不改变状态，正常继续循环。
         return
+
+    def _merge_multi_reflection(
+        self,
+        primary_decision: Optional[str],
+        reflection_block: Optional[dict],
+        parsed: ParsedOutput,
+        acted: bool,
+    ) -> Optional[str]:
+        """多角色反思；``next_action`` 不一致时抛出 :class:`EvidenceConflict`。"""
+        items: list[RoleReflection] = []
+        if primary_decision and primary_decision in ("retry", "revise", "done"):
+            rb = reflection_block or {}
+            items.append(
+                RoleReflection(
+                    role=self._config.role,
+                    observations=str(rb.get("observations", "")),
+                    next_action=cast(ReflectionDecision, primary_decision),
+                    raw_block=dict(rb),
+                )
+            )
+        for role in self._config.multi_reflection_roles:
+            na = self._reflect_as_role(role, parsed, acted)
+            items.append(
+                RoleReflection(
+                    role=role,
+                    observations="",
+                    next_action=cast(ReflectionDecision, na),
+                    raw_block={},
+                )
+            )
+
+        bundle = MultiReflectionBundle(items=items)
+        self._trace.log(
+            KIND_MULTI_REFLECTION,
+            bundle.model_dump(mode="json"),
+            state=self._state,
+            turn=self._turn,
+            context=self._context,
+        )
+
+        actions = [it.next_action for it in items if it.next_action in ("retry", "revise", "done")]
+        if not actions:
+            return primary_decision
+        unique = set(actions)
+        if len(unique) > 1:
+            raise EvidenceConflict(
+                "多角色反思对 next_action 结论不一致",
+                details={"bundle": bundle.model_dump(mode="json")},
+            )
+        return actions[0]
+
+    def _reflect_as_role(self, role: AgentRole, parsed: ParsedOutput, acted: bool) -> str:
+        """为附加角色单独发起一次短反思 LLM 调用。"""
+        system = SystemPromptBuilder(role, self._mode, self._tools.list_specs()).render()
+        digest = (parsed.raw_text or "")[:1200]
+        user_msg = (
+            f"本轮 acted={acted}。\n"
+            f"主助手输出摘录（含结构化块）：\n{digest}\n\n"
+            "请只输出一个 ```json``` 反思块，必须包含 next_action，取值 retry|revise|done。"
+        )
+        reply = self._llm.chat(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ]
+        )
+        pr = parse_response(reply, mode=self._mode, require_block=False)
+        for block in pr.json_blocks:
+            if "next_action" in block:
+                v = str(block.get("next_action", "")).lower().strip()
+                if v in ("retry", "revise", "done"):
+                    return v
+        return "retry"
+
+    def _maybe_human_intervention(self, *, phase: str) -> Optional[str]:
+        """若启用干预且 ``timeout>0``，在 ``INTERVENTION`` 状态等待人类。
+
+        若收到人类文本，写入 USER 消息并返回 ``\"retry\"`` 以覆盖主反思结论
+        （上帝指令优先）；否则返回 ``None``。
+        """
+        if not (self._intervention and self._config.intervention_enabled):
+            return None
+        timeout = float(self._config.intervention_timeout_s)
+        if timeout <= 0:
+            return None
+        self._transition(AgentState.INTERVENTION)
+        self._trace.log(
+            KIND_INTERVENTION_SUSPEND,
+            {"phase": phase, "timeout_s": timeout},
+            state=self._state,
+            turn=self._turn,
+            context=self._context,
+        )
+        msg = self._intervention.wait(timeout=timeout)
+        if msg:
+            self._trace.log(
+                KIND_HUMAN_OVERRIDE,
+                {"text": msg, "phase": phase},
+                state=self._state,
+                turn=self._turn,
+                context=self._context,
+            )
+            self._context.add(
+                ChatMessage(role=MessageRole.USER, content=f"[上帝指令] {msg}")
+            )
+            if self._state is AgentState.INTERVENTION:
+                self._transition(AgentState.REFLECTING)
+            return "retry"
+        if self._state is AgentState.INTERVENTION:
+            self._transition(AgentState.REFLECTING)
+        return None
 
     # ------------------- 错误处理 ------------------- #
 
@@ -288,6 +451,7 @@ class Workflow:
             {"kind": kind, "message": str(exc), "details": getattr(exc, "details", None)},
             state=self._state,
             turn=self._turn,
+            context=self._context,
         )
         feedback = self._format_feedback(exc)
         self._context.add(ChatMessage(role=MessageRole.SYSTEM, content=feedback))
@@ -350,6 +514,7 @@ class Workflow:
             {"from": old.value, "to": new_state.value},
             state=new_state,
             turn=self._turn,
+            context=self._context,
         )
 
 

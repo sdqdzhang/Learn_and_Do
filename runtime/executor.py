@@ -179,6 +179,21 @@ class Executor:
         # 负责真正的容器清理；一次性容器在 _run_command 内部就已经自删了。
         pass
 
+    def teardown_persistent_container(self) -> None:
+        """删除由 ``container_name`` 标识的长生命周期容器（会话结束时调用）。"""
+        if not self._container_name:
+            return
+        name = self._container_name
+        try:
+            client = self._docker_client()
+            try:
+                c = client.containers.get(name)
+                c.remove(force=True)
+            except Exception:  # noqa: BLE001
+                logger.warning("删除持久化容器 %s 失败（可能已不存在）", name)
+        except Exception:  # noqa: BLE001
+            logger.debug("teardown_persistent_container：docker 不可用，跳过")
+
     # ------------------- 文件注入 ------------------- #
 
     def _apply_files(self, files: List[FileOperation]) -> None:
@@ -253,6 +268,36 @@ class Executor:
                 details={"error": str(exc)},
             ) from exc
 
+    def _ensure_persistent_container(self, client, host_workspace: str) -> "object":
+        """为 ``container_name`` 启动或复用 ``sleep infinity`` 常驻容器。"""
+        import docker  # type: ignore
+
+        assert self._container_name is not None
+        name = self._container_name
+        try:
+            c = client.containers.get(name)
+            if c.status != "running":
+                c.start()
+            return c
+        except docker.errors.NotFound:  # type: ignore[attr-defined]
+            pass
+        c = client.containers.run(
+            image=self._config.image,
+            command=["sleep", "infinity"],
+            name=name,
+            volumes={host_workspace: {"bind": "/workspace", "mode": "rw"}},
+            working_dir="/workspace",
+            mem_limit=self._config.memory_limit,
+            nano_cpus=int(self._config.cpu_limit * 1e9),
+            network_mode=os.getenv("CONTAINER_NETWORK_MODE", "bridge"),
+            detach=True,
+            stdout=True,
+            stderr=True,
+            remove=False,
+        )
+        logger.info("已启动持久化沙箱容器：%s", name)
+        return c
+
     def _run_command(
         self,
         command: Sequence[str],
@@ -267,11 +312,40 @@ class Executor:
         run_name = self._container_name or f"{self._config.name_prefix}-{uuid.uuid4().hex[:8]}"
         host_workspace = str(self._workspace)
 
+        # ---------- 会话级持久化容器：docker exec，不在每轮销毁 ----------
+        if self._container_name:
+            container = self._ensure_persistent_container(client, host_workspace)
+            try:
+                exit_code, streams = container.exec_run(
+                    cmd=["bash", "-lc", full_cmd],
+                    workdir="/workspace",
+                    demux=True,
+                )
+                exit_code = int(exit_code)
+                if streams is None:
+                    stdout_b, stderr_b = b"", b""
+                else:
+                    stdout_b, stderr_b = streams[0] or b"", streams[1] or b""
+                stdout = stdout_b.decode("utf-8", errors="replace")
+                stderr = stderr_b.decode("utf-8", errors="replace")
+            except Exception as exc:  # noqa: BLE001
+                raise ResourceExhausted(
+                    "持久化容器内命令执行失败或超时",
+                    details={"error": str(exc), "timeout_s": timeout},
+                ) from exc
+            env_info = {
+                "image": self._config.image,
+                "container_name": self._container_name,
+                "persistent": True,
+            }
+            return stdout, stderr, exit_code, env_info
+
+        # ---------- 一次性容器（无 container_name）----------
         try:
             container = client.containers.run(
                 image=self._config.image,
                 command=["bash", "-lc", full_cmd],
-                name=run_name if not self._container_name else None,
+                name=run_name,
                 volumes={host_workspace: {"bind": "/workspace", "mode": "rw"}},
                 working_dir="/workspace",
                 mem_limit=self._config.memory_limit,
@@ -308,7 +382,7 @@ class Executor:
             except Exception:  # noqa: BLE001
                 logger.warning("删除容器 %s 失败", run_name)
 
-        env_info = {"image": self._config.image, "container_name": run_name}
+        env_info = {"image": self._config.image, "container_name": run_name, "persistent": False}
         return stdout, stderr, exit_code, env_info
 
     def _compose_shell_command(

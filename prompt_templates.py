@@ -56,6 +56,16 @@ _ROLE_BASE: Dict[AgentRole, str] = {
         '{"observations": "...", "conflicts": [...], '
         '"next_action": "retry|revise|done"}。'
     ),
+    AgentRole.AUDITOR: (
+        "你是审计员（Auditor）。从合规与可追溯角度审视当前轮次的计划、工具"
+        "结果与主张。只输出一个 ```json``` 反思块，键名与 Reflector 相同，"
+        "next_action 取 retry|revise|done 之一。"
+    ),
+    AgentRole.CHALLENGER: (
+        "你是挑战者（Challenger）。刻意寻找论证漏洞、过度自信或未验证假设。"
+        "只输出一个 ```json``` 反思块，键名与 Reflector 相同，"
+        "next_action 取 retry|revise|done 之一。"
+    ),
 }
 
 

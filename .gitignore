@@ -64,6 +64,10 @@ logs/
 # ---------- Jupyter ----------
 .ipynb_checkpoints/
 
+# ---------- Frontend (Vite / npm, web/) ----------
+node_modules/
+*.local
+
 # ---------- Tiny-Devin runtime artifacts ----------
 # Workspace is shared with the sandbox container; track folder, ignore content.
 runtime/workspace/*

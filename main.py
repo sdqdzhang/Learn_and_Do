@@ -24,6 +24,7 @@ import argparse
 import logging
 import os
 import sys
+from dataclasses import replace
 from typing import Optional
 
 from core.audit import TraceLogger
@@ -33,6 +34,7 @@ from core.session_manager import SessionManager
 from core.workflow import Workflow, WorkflowConfig
 from memory.session_context import SessionContext
 from memory.vector_store import VectorStore
+from runtime.stream_tunnel import default_tunnel
 from tools.file_io import FileListTool, FileReadTool, FileWriteTool
 from tools.rag import RagQueryTool, RagUpsertTool
 from tools.registry import ToolRegistry
@@ -155,7 +157,8 @@ def main(argv: Optional[list] = None) -> int:
         print(f"启动 session 失败：{exc}", file=sys.stderr)
         return 2
 
-    trace = TraceLogger(session_id=session_id)
+    context = SessionContext()
+    context.set_summarizer(_build_summarizer(llm))
 
     tools = ToolRegistry()
     _register_tools(
@@ -165,14 +168,13 @@ def main(argv: Optional[list] = None) -> int:
         enable_rag=not args.no_rag,
     )
 
-    context = SessionContext()
-    context.set_summarizer(_build_summarizer(llm))
+    trace = TraceLogger(session_id=session_id, context=context)
+    default_tunnel.register(session_id, session_id)
 
-    workflow_config = WorkflowConfig(
-        max_turns=args.max_turns
-        if args.max_turns is not None
-        else WorkflowConfig.from_env(role=role).max_turns,
-        role=role,
+    base_wf = WorkflowConfig.from_env(role=role)
+    workflow_config = replace(
+        base_wf,
+        max_turns=args.max_turns if args.max_turns is not None else base_wf.max_turns,
     )
 
     workflow = Workflow(
@@ -190,6 +192,7 @@ def main(argv: Optional[list] = None) -> int:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2
     finally:
+        default_tunnel.unregister(session_id)
         trace.close()
         session.stop()
 

@@ -16,7 +16,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Iterator, List, Mapping, Optional
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 from openai import APIConnectionError, APIError, APITimeoutError, OpenAI, RateLimitError
 
@@ -111,6 +111,24 @@ class LLMClient:
         会在遇到超时、瞬态连接错误、限流响应时按 ``config.max_retries`` 重试。
         预算耗尽时抛 :class:`LLMTimeoutError`。
         """
+        return self.chat_with_usage(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra=extra,
+        )[0]
+
+    def chat_with_usage(
+        self,
+        messages: List[ChatMessage],
+        *,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        extra: Optional[dict] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """与 :meth:`chat` 相同，但额外返回 OpenAI 兼容的 ``usage`` 字典（可能为空）。"""
         return self._with_retries(
             lambda: self._chat_once(
                 messages=messages,
@@ -166,7 +184,7 @@ class LLMClient:
         temperature: Optional[float],
         max_tokens: Optional[int],
         extra: Optional[dict],
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
         response = self._client.chat.completions.create(
             model=model or self._config.model,
             messages=list(messages),
@@ -175,8 +193,16 @@ class LLMClient:
             **(extra or {}),
         )
         if not response.choices:
-            return ""
-        return response.choices[0].message.content or ""
+            return "", {}
+        text = response.choices[0].message.content or ""
+        usage: Dict[str, Any] = {}
+        u = getattr(response, "usage", None)
+        if u is not None:
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                val = getattr(u, key, None)
+                if val is not None:
+                    usage[key] = val
+        return text, usage
 
     def _coerce_temperature(self, value: Optional[float]) -> float:
         return self._config.temperature if value is None else value
