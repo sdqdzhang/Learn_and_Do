@@ -60,6 +60,7 @@ class AgentState(str, Enum):
     INTERVENTION = "intervention"
     DONE = "done"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class AgentRole(str, Enum):

@@ -23,11 +23,14 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
-from typing import FrozenSet, Optional, Tuple, cast
+from typing import Any, Dict, FrozenSet, Optional, Tuple, cast
 
 from core.audit import (
     KIND_ERROR,
+    KIND_GUARD_OUTBOUND,
+    KIND_GUARD_PREFLIGHT,
     KIND_HUMAN_OVERRIDE,
     KIND_INTERVENTION_SUSPEND,
     KIND_MULTI_REFLECTION,
@@ -46,6 +49,14 @@ from core.exceptions import (
     LLMTimeoutError,
     RetryableError,
     TinyDevinError,
+)
+from core.repair_guard import (
+    OUTBOUND_SYSTEM,
+    PREFLIGHT_SYSTEM,
+    build_outbound_user,
+    build_preflight_user,
+    extract_json_verdict,
+    summarize_tool_calls,
 )
 from core.intervention import InterventionChannel
 from core.schema import (
@@ -94,6 +105,11 @@ class WorkflowConfig:
     intervention_timeout_s: float = 0.0
     sensitive_tool_names: FrozenSet[str] = field(default_factory=frozenset)
     multi_reflection_roles: Tuple[AgentRole, ...] = field(default_factory=tuple)
+    # 独立 LLM 会话：工具执行前修复结构化输出；出站「假完成」校验。
+    guard_preflight_enabled: bool = False
+    guard_outbound_enabled: bool = False
+    guard_max_rounds: int = 2
+    guard_model: Optional[str] = None
 
     @classmethod
     def from_env(cls, *, role: Optional[AgentRole] = None) -> "WorkflowConfig":
@@ -112,6 +128,11 @@ class WorkflowConfig:
         sensitive = frozenset(t.strip() for t in sens_raw.split(",") if t.strip())
         iv = os.getenv("WORKFLOW_INTERVENTION_ENABLED", "").lower() in ("1", "true", "yes")
         iv_to = float(os.getenv("WORKFLOW_INTERVENTION_TIMEOUT_S", "0"))
+        gf = os.getenv("WORKFLOW_GUARD_PREFLIGHT", "0").lower() in ("1", "true", "yes")
+        go = os.getenv("WORKFLOW_GUARD_OUTBOUND", "0").lower() in ("1", "true", "yes")
+        gmr = int(os.getenv("WORKFLOW_GUARD_MAX_ROUNDS", "2"))
+        gmr = max(1, min(gmr, 5))
+        gmodel = os.getenv("WORKFLOW_GUARD_MODEL", "").strip() or None
         return cls(
             max_turns=int(os.getenv("WORKFLOW_MAX_TURNS", "10")),
             role=role or AgentRole.CODER,
@@ -119,6 +140,10 @@ class WorkflowConfig:
             intervention_timeout_s=iv_to,
             sensitive_tool_names=sensitive,
             multi_reflection_roles=tuple(multi),
+            guard_preflight_enabled=gf,
+            guard_outbound_enabled=go,
+            guard_max_rounds=gmr,
+            guard_model=gmodel,
         )
 
 
@@ -137,6 +162,7 @@ class Workflow:
         mode: TaskMode,
         config: Optional[WorkflowConfig] = None,
         intervention: Optional[InterventionChannel] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> None:
         self._llm = llm
         self._tools = tools
@@ -145,6 +171,7 @@ class Workflow:
         self._mode = mode
         self._config = config or WorkflowConfig.from_env()
         self._intervention = intervention
+        self._cancel_event = cancel_event
         self._state = AgentState.IDLE
         self._turn = 0
 
@@ -166,6 +193,9 @@ class Workflow:
             return self._finalize_failed(str(exc))
 
         while True:
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                return self._finalize_cancelled()
+
             if self._turn >= self._config.max_turns:
                 return self._finalize_failed(
                     f"已达到 max_turns={self._config.max_turns} 但仍未结束",
@@ -176,10 +206,14 @@ class Workflow:
             try:
                 reply = self._think()
                 parsed = self._parse_reply(reply)
+                reply, parsed = self._maybe_preflight_guard(reply, parsed)
 
                 acted = self._maybe_act(parsed)
 
                 if self._is_terminal_reply(reply, parsed) and not acted:
+                    proceed, reply, parsed = self._maybe_outbound_guard(reply, parsed, acted)
+                    if not proceed:
+                        continue
                     return self._finalize_done(reply)
 
                 self._reflect(parsed, acted)
@@ -224,17 +258,49 @@ class Workflow:
         parsed = parse_response(reply, mode=self._mode, require_block=False)
         self._trace.log(
             KIND_RESPONSE,
-            {
-                "content": reply,
-                "thoughts": parsed.thoughts,
-                "usage": usage,
-            },
+            self._response_trace_payload(reply, parsed, usage),
             state=self._state,
             turn=self._turn,
             context=self._context,
         )
         self._context.add(ChatMessage(role=MessageRole.ASSISTANT, content=reply))
         return reply
+
+    def _response_trace_payload(
+        self,
+        reply: str,
+        parsed: ParsedOutput,
+        usage: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """写入轨迹的 response 载荷；附加上下文状态说明便于前端画布展示。"""
+        payload: Dict[str, Any] = {
+            "content": reply,
+            "thoughts": parsed.thoughts,
+            "usage": usage,
+        }
+        msgs = self._context.messages()
+        if msgs and msgs[-1].role is MessageRole.SYSTEM:
+            if (msgs[-1].content or "").startswith("[出站校验]"):
+                payload["session_context_note"] = (
+                    "上一条为出站校验：此前「完成」被驳回或校验 JSON 无效，本轮须继续作答。"
+                )
+            elif (msgs[-1].content or "").startswith("[反馈]"):
+                payload["session_context_note"] = (
+                    "上一条为系统纠错反馈：解析失败、工具预检失败等之后的重试轮。"
+                )
+            elif (msgs[-1].content or "").startswith("[上帝指令]"):
+                payload["session_context_note"] = "上一条为人类上帝指令，本轮接续执行。"
+            elif (msgs[-1].content or "").startswith("[反思器]"):
+                payload["session_context_note"] = "上一条为反思器请求修订计划。"
+
+        if not (reply or "").strip():
+            ct = usage.get("completion_tokens")
+            payload["display_hint"] = (
+                "本节点记录的 assistant 正文为空。"
+                f" completion_tokens={ct!r}。"
+                "常见原因：API 异常、仅空白/不可见 token、上游截断或模型异常短答。"
+            )
+        return payload
 
     def _parse_reply(self, reply: str) -> ParsedOutput:
         # 顶层保持宽容：assistant 这一轮可能纯粹是叙述（"我先来规划一下..."），
@@ -473,6 +539,197 @@ class Workflow:
         suffix = f" 细节：{details}" if details else ""
         return f"[反馈] 可重试失败（{kind}）：{exc}。{suffix}"
 
+    # ------------------- 模型护栏（独立会话） ------------------- #
+
+    def _last_user_goal(self) -> str:
+        for m in reversed(self._context.messages()):
+            if m.role is not MessageRole.USER:
+                continue
+            c = m.content
+            if c.startswith("[上帝指令]") or c.startswith("[反馈]") or c.startswith("[出站校验]"):
+                continue
+            return c
+        return ""
+
+    def _guard_chat(self, system: str, user: str) -> str:
+        messages = [
+            ChatMessage(role=MessageRole.SYSTEM, content=system),
+            ChatMessage(role=MessageRole.USER, content=user),
+        ]
+        return self._llm.chat(messages, model=self._config.guard_model)
+
+    def _maybe_preflight_guard(self, reply: str, parsed: ParsedOutput) -> Tuple[str, ParsedOutput]:
+        """工具执行前：独立模型会话尝试把 assistant 正文修到可解析且工具名合法。"""
+        if not self._config.guard_preflight_enabled or not parsed.tool_calls:
+            return reply, parsed
+
+        allowed = {t.name for t in self._tools.list_specs()}
+        last_err: Optional[Exception] = None
+        for attempt in range(1, self._config.guard_max_rounds + 1):
+            user = build_preflight_user(
+                assistant_reply=reply,
+                mode=self._mode,
+                allowed_tool_names=sorted(allowed),
+            )
+            try:
+                fixed = self._guard_chat(PREFLIGHT_SYSTEM, user)
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                logger.warning("guard preflight LLM 调用失败：%s", exc)
+                continue
+            try:
+                new_p = parse_response(fixed, mode=self._mode, require_block=False)
+            except CodeFormatError as exc:
+                last_err = exc
+                continue
+            if not new_p.tool_calls:
+                last_err = CodeFormatError("预检模型未产出任何 <tool>")
+                continue
+            unknown = [c.name for c in new_p.tool_calls if c.name not in allowed]
+            if unknown:
+                last_err = CodeFormatError(f"预检模型产出未知工具：{unknown!r}")
+                continue
+            if not self._context.replace_last_assistant_content(fixed):
+                last_err = CodeFormatError("上下文中找不到 assistant，无法写回预检稿")
+                continue
+            self._trace.log(
+                KIND_GUARD_PREFLIGHT,
+                {
+                    "ok": True,
+                    "attempt": attempt,
+                    "tool_summary": summarize_tool_calls(new_p),
+                    "repaired_preview": fixed[:800],
+                },
+                state=self._state,
+                turn=self._turn,
+                context=self._context,
+            )
+            return fixed, new_p
+
+        self._trace.log(
+            KIND_GUARD_PREFLIGHT,
+            {
+                "ok": False,
+                "attempts": self._config.guard_max_rounds,
+                "error": repr(last_err) if last_err else None,
+            },
+            state=self._state,
+            turn=self._turn,
+            context=self._context,
+        )
+        raise CodeFormatError(
+            "工具预检在限次内仍无法产出可执行且合规的工具调用",
+            details={"last_error": str(last_err) if last_err else None, "snippet": reply[:400]},
+        )
+
+    def _maybe_outbound_guard(
+        self,
+        reply: str,
+        parsed: ParsedOutput,
+        acted: bool,
+    ) -> Tuple[bool, str, ParsedOutput]:
+        """在「终止哨兵且本轮未执行工具」时：独立模型判断是否假完成；不通过则注入 SYSTEM 并继续主循环。"""
+        if not self._config.guard_outbound_enabled:
+            return True, reply, parsed
+        if not (self._is_terminal_reply(reply, parsed) and not acted):
+            return True, reply, parsed
+
+        user_goal = self._last_user_goal()
+        for attempt in range(1, self._config.guard_max_rounds + 1):
+            user = build_outbound_user(
+                assistant_reply=reply,
+                mode=self._mode,
+                user_goal=user_goal,
+                acted=acted,
+            )
+            try:
+                raw = self._guard_chat(OUTBOUND_SYSTEM, user)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("guard outbound LLM 调用失败：%s", exc)
+                self._trace.log(
+                    KIND_GUARD_OUTBOUND,
+                    {"ok": False, "attempt": attempt, "error": str(exc)},
+                    state=self._state,
+                    turn=self._turn,
+                    context=self._context,
+                )
+                break
+            verdict = extract_json_verdict(raw)
+            if verdict is None:
+                self._trace.log(
+                    KIND_GUARD_OUTBOUND,
+                    {"ok": False, "attempt": attempt, "error": "no_json_verdict"},
+                    state=self._state,
+                    turn=self._turn,
+                    context=self._context,
+                )
+                continue
+
+            allow = bool(verdict.get("allow_session_done"))
+            replacement = str(verdict.get("assistant_replacement", "") or "").strip()
+            feedback = str(verdict.get("feedback", "") or "").strip()
+
+            if replacement:
+                if self._context.replace_last_assistant_content(replacement):
+                    reply = replacement
+                    try:
+                        parsed = parse_response(replacement, mode=self._mode, require_block=False)
+                    except CodeFormatError as exc:
+                        self._context.add(
+                            ChatMessage(
+                                role=MessageRole.SYSTEM,
+                                content=f"[出站校验] 替换稿仍无法解析：{exc}",
+                            )
+                        )
+                        self._trace.log(
+                            KIND_GUARD_OUTBOUND,
+                            {
+                                "ok": False,
+                                "attempt": attempt,
+                                "error": "replacement_parse_failed",
+                            },
+                            state=self._state,
+                            turn=self._turn,
+                            context=self._context,
+                        )
+                        return False, reply, parsed
+
+            self._trace.log(
+                KIND_GUARD_OUTBOUND,
+                {
+                    "ok": True,
+                    "attempt": attempt,
+                    "allow_session_done": allow,
+                    "feedback": feedback[:500],
+                },
+                state=self._state,
+                turn=self._turn,
+                context=self._context,
+            )
+            if allow:
+                return True, reply, parsed
+
+            note = feedback or (
+                "出站校验未通过：请继续完成任务，仅在真正完成后使用 [完成] 标记。"
+            )
+            self._context.add(ChatMessage(role=MessageRole.SYSTEM, content=f"[出站校验]\n{note}"))
+            return False, reply, parsed
+
+        self._context.add(
+            ChatMessage(
+                role=MessageRole.SYSTEM,
+                content="[出站校验]\n模型未返回合法 JSON 结论，本轮不允结束；请继续。",
+            )
+        )
+        self._trace.log(
+            KIND_GUARD_OUTBOUND,
+            {"ok": False, "fallback": True},
+            state=self._state,
+            turn=self._turn,
+            context=self._context,
+        )
+        return False, reply, parsed
+
     # ------------------- 终止处理 ------------------- #
 
     def _is_terminal_reply(self, reply: str, parsed: ParsedOutput) -> bool:
@@ -491,6 +748,15 @@ class Workflow:
             final_state=self._state,
             turns=self._turn,
             last_message=last_reply,
+        )
+
+    def _finalize_cancelled(self) -> WorkflowResult:
+        self._transition(AgentState.CANCELLED)
+        return WorkflowResult(
+            session_id=self._trace.session_id,
+            final_state=self._state,
+            turns=self._turn,
+            last_message="用户已停止本轮 workflow。",
         )
 
     def _finalize_failed(self, error: str) -> WorkflowResult:

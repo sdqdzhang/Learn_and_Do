@@ -113,6 +113,15 @@ class SessionContext:
         self._messages.append(message)
         self.compress_if_needed()
 
+    def replace_last_assistant_content(self, new_content: str) -> bool:
+        """将最近一条 ASSISTANT 消息的 ``content`` 替换为 ``new_content``。"""
+        for i in range(len(self._messages) - 1, -1, -1):
+            if self._messages[i].role is MessageRole.ASSISTANT:
+                cur = self._messages[i]
+                self._messages[i] = cur.model_copy(update={"content": new_content})
+                return True
+        return False
+
     def extend(self, messages: List[ChatMessage]) -> None:
         for m in messages:
             self._messages.append(m)

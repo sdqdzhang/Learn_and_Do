@@ -6,7 +6,8 @@ export type AgentState =
   | "reflecting"
   | "intervention"
   | "done"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export type TraceEvent = {
   ts: number;
@@ -24,6 +25,8 @@ export type CognitiveNodeData = {
   thoughts: string[];
   usage: Record<string, unknown> | null;
   contentFallback: string;
+  /** 后端在 response payload 中写入的状态说明（出站校验、空 completion 等），画布在正文为空时优先展示。 */
+  traceHints: string[];
   rawEvent: TraceEvent;
 };
 

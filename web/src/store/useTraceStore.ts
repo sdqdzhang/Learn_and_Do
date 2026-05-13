@@ -8,6 +8,7 @@ import type {
   TraceEvent,
 } from "../types/trace";
 import { edgePaint } from "../utils/edgeAppearance";
+import { extractResponseTraceHints } from "../utils/responseTraceHints";
 import { extractThoughts, normalizeUsage } from "../utils/thoughtAdapter";
 import { extractToolOutputParts } from "../utils/toolOutput";
 
@@ -190,6 +191,7 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
         const usage = normalizeUsage(event.payload);
         const content =
           typeof event.payload.content === "string" ? event.payload.content : "";
+        const traceHints = extractResponseTraceHints(event.payload);
         const node: Node<CognitiveNodeData> = {
           id,
           type: "cognitive",
@@ -198,6 +200,7 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
             thoughts,
             usage,
             contentFallback: content,
+            traceHints,
             rawEvent: event,
           },
         };

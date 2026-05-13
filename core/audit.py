@@ -37,6 +37,8 @@ KIND_PLAN = "plan"
 KIND_INTERVENTION_SUSPEND = "intervention_suspend"
 KIND_HUMAN_OVERRIDE = "human_override"
 KIND_MULTI_REFLECTION = "multi_reflection"
+KIND_GUARD_PREFLIGHT = "guard_preflight"
+KIND_GUARD_OUTBOUND = "guard_outbound"
 
 
 class TraceLogger:
@@ -188,4 +190,6 @@ __all__ = [
     "KIND_INTERVENTION_SUSPEND",
     "KIND_HUMAN_OVERRIDE",
     "KIND_MULTI_REFLECTION",
+    "KIND_GUARD_PREFLIGHT",
+    "KIND_GUARD_OUTBOUND",
 ]

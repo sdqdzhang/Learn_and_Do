@@ -7,17 +7,28 @@ export function extractToolOutputParts(
   const raw = payload.output;
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     const o = raw as Record<string, unknown>;
-    const stdout = typeof o.stdout === "string" ? o.stdout : "";
-    const stderr = typeof o.stderr === "string" ? o.stderr : "";
+    let stdout = typeof o.stdout === "string" ? o.stdout : "";
+    let stderr = typeof o.stderr === "string" ? o.stderr : "";
     const metrics =
       o.metrics && typeof o.metrics === "object" ? (o.metrics as Record<string, unknown>) : null;
     const elapsed =
       metrics && typeof metrics.elapsed_ms === "number" ? `${metrics.elapsed_ms}ms` : "";
     const code =
       metrics && typeof metrics.exit_code === "number" ? `exit ${metrics.exit_code}` : "";
-    const summary =
+    let summary =
       [code, elapsed].filter(Boolean).join(" · ") ||
       (stdout.trim() ? stdout.trim().split("\n")[0]!.slice(0, 96) : "");
+
+    const hasProcessStreams = "stdout" in o || "stderr" in o;
+    if (!hasProcessStreams && Object.keys(o).length > 0) {
+      const json = JSON.stringify(o, null, 2);
+      if (!stdout.trim() && !stderr.trim()) {
+        stdout = json;
+      }
+      if (!summary) {
+        summary = json.split("\n")[0]!.slice(0, 120);
+      }
+    }
     return { stdout, stderr, summary };
   }
   if (typeof raw === "string") {

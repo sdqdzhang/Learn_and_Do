@@ -185,14 +185,41 @@ class Executor:
             return
         name = self._container_name
         try:
+            import docker  # type: ignore
+        except ImportError:
+            logger.debug("teardown_persistent_container：未安装 docker SDK，跳过")
+            return
+
+        try:
             client = self._docker_client()
-            try:
-                c = client.containers.get(name)
-                c.remove(force=True)
-            except Exception:  # noqa: BLE001
-                logger.warning("删除持久化容器 %s 失败（可能已不存在）", name)
-        except Exception:  # noqa: BLE001
-            logger.debug("teardown_persistent_container：docker 不可用，跳过")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "teardown_persistent_container：无法连接 Docker，容器 %s 可能残留：%s",
+                name,
+                exc,
+            )
+            return
+
+        try:
+            c = client.containers.get(name)
+        except docker.errors.NotFound:  # type: ignore[attr-defined]
+            # 常见情况：session 内从未触发过 Executor.run，持久容器尚未创建。
+            logger.debug("持久化容器 %s 不存在，跳过删除", name)
+            return
+
+        try:
+            if getattr(c, "status", None) == "running":
+                c.stop(timeout=15)
+            c.remove(force=True)
+        except docker.errors.NotFound:  # type: ignore[attr-defined]
+            logger.debug("持久化容器 %s 已被删除", name)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "删除持久化容器 %s 失败（容器可能仍残留在 Docker 中）：%s",
+                name,
+                exc,
+                exc_info=True,
+            )
 
     # ------------------- 文件注入 ------------------- #
 
@@ -307,6 +334,7 @@ class Executor:
     ) -> tuple[str, str, int, dict]:
         self._ensure_image()
         client = self._docker_client()
+        import docker  # type: ignore
 
         full_cmd = self._compose_shell_command(command, extra_pip=extra_pip)
         run_name = self._container_name or f"{self._config.name_prefix}-{uuid.uuid4().hex[:8]}"
@@ -378,9 +406,23 @@ class Executor:
             ) from exc
         finally:
             try:
-                container.remove(force=True)
-            except Exception:  # noqa: BLE001
-                logger.warning("删除容器 %s 失败", run_name)
+                try:
+                    container.reload()
+                except docker.errors.NotFound:  # type: ignore[attr-defined]
+                    pass
+                else:
+                    if container.status == "running":
+                        container.stop(timeout=15)
+                    container.remove(force=True)
+            except docker.errors.NotFound:  # type: ignore[attr-defined]
+                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "删除一次性容器 %s 失败（容器可能残留在 Docker 中）：%s",
+                    run_name,
+                    exc,
+                    exc_info=True,
+                )
 
         env_info = {"image": self._config.image, "container_name": run_name, "persistent": False}
         return stdout, stderr, exit_code, env_info

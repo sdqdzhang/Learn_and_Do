@@ -60,6 +60,7 @@ htmlcov/
 # ---------- Logs ----------
 *.log
 logs/
+log/
 
 # ---------- Jupyter ----------
 .ipynb_checkpoints/
@@ -76,6 +77,10 @@ runtime/workspace/*
 # Trace logs (one .jsonl per session)
 runtime/traces/*
 !runtime/traces/.gitkeep
+
+# WebSocket 会话轨迹（前端可回放，见 server TraceLogger log_dir）
+log/*.jsonl
+!log/.gitkeep
 
 # Local vector store (ChromaDB persistent files)
 runtime/vector_store/

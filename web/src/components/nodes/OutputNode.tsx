@@ -18,7 +18,7 @@ export default function OutputNode({ data }: Props) {
 
       <div className="mb-1 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-sky-300/95">
         <ScrollText className="h-3 w-3 shrink-0 text-sky-400/90" aria-hidden />
-        输出 · stdout/stderr
+        输出 · 结果
       </div>
       <div className="truncate text-[11px] font-semibold text-sky-100">{toolName}</div>
       {summary ? (
@@ -29,7 +29,7 @@ export default function OutputNode({ data }: Props) {
         className="mt-2 max-h-[130px] overflow-auto whitespace-pre-wrap break-words rounded-md border border-slate-700/90 bg-black/50 p-2 font-mono text-[10px] leading-snug text-slate-100"
         tabIndex={0}
       >
-        {out || "（无 stdout）"}
+        {out || "（无终端输出；若为 file_* 等工具，见上方摘要或侧栏 JSON）"}
       </pre>
 
       {err ? (

@@ -18,7 +18,7 @@ from utils.llm_client import LLMClient
 logger = logging.getLogger(__name__)
 
 
-def build_summarizer(client: LLMClient) -> Callable:
+def build_summarizer(client: LLMClient, *, summarizer_model: Optional[str] = None) -> Callable:
     def summarize(messages) -> str:
         prompt = (
             "请把下面这段对话压缩成一份简洁的摘要。"
@@ -32,7 +32,8 @@ def build_summarizer(client: LLMClient) -> Callable:
             [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": flat},
-            ]
+            ],
+            model=summarizer_model or None,
         )
 
     return summarize

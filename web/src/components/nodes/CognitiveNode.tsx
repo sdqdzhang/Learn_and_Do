@@ -7,8 +7,14 @@ type Props = { data: CognitiveNodeData };
 const BARE_DONE = /^\[(完成|done)\]\s*$/i;
 
 export default function CognitiveNode({ data }: Props) {
-  const { thoughts, usage, contentFallback } = data;
+  const { thoughts, usage, contentFallback, traceHints } = data;
   const trimmed = contentFallback.trim();
+  const emptyBodyFallback =
+    traceHints.length > 0
+      ? traceHints
+      : [
+          "（本轮 assistant 正文为空且无结构化 thought；常见于解析失败后重试瞬间的空 completion；完整载荷见侧栏）",
+        ];
   const lines =
     thoughts.length > 0
       ? thoughts
@@ -21,9 +27,7 @@ export default function CognitiveNode({ data }: Props) {
                 ]
               : []),
           ]
-        : [
-            "（本轮 assistant 正文为空且无结构化 thought；常见于解析失败后重试瞬间的空 completion；完整载荷见侧栏）",
-          ];
+        : emptyBodyFallback;
 
   return (
     <div className="w-[300px] rounded-lg border-2 border-slate-600 bg-gradient-to-br from-slate-900/95 via-slate-800/95 to-slate-900/90 px-3 py-2.5 text-slate-100 shadow-lg shadow-slate-950/40">
