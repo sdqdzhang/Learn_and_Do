@@ -50,7 +50,13 @@ export type OutputNodeData = {
   rawEvent: TraceEvent;
 };
 
+/** 后端 `reflection` /（旧）`multi_reflection` 事件在画布上的展示；单段正文。 */
+export type ReflectionNodeData = {
+  summary: string;
+  rawEvent: TraceEvent;
+};
+
 export type ChainTip = {
   nodeId: string;
-  variant: "cognitive" | "execution" | "output";
+  variant: "cognitive" | "reflection" | "execution" | "output";
 };

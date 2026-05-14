@@ -2,6 +2,7 @@
 
 from .exceptions import (
     CodeFormatError,
+    EmptyAssistantReplyError,
     ContainerImageError,
     EvidenceConflict,
     FatalError,
@@ -18,6 +19,7 @@ __all__ = [
     "RetryableError",
     "FatalError",
     "CodeFormatError",
+    "EmptyAssistantReplyError",
     "MissingPathError",
     "LLMTimeoutError",
     "EvidenceConflict",

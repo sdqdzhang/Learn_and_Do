@@ -69,6 +69,23 @@ _ROLE_BASE: Dict[AgentRole, str] = {
 }
 
 
+# 与 ``<tool>`` 解析器（utils.parser）对齐：CDATA 内仍为 JSON 文本；多行用 \n 转义。
+_TOOL_JSON_RULES_CN = (
+    "- `<tool>` 标签内必须是合法 JSON 对象；禁止在 JSON 里用 Python 三引号 `\"\"\"`/`'''` 表示字符串。\n"
+    "- 多行 `code` 等长字符串：在 JSON 内用 `\\n` 转义换行，或把**整段 JSON**用 CDATA 包起来，例如 "
+    "`<tool name=\"python_repl\"><![CDATA[{\"code\":\"import os\\\\nprint(1)\"}]]></tool>`。\n"
+)
+
+_FILE_BODY_RULES_CN = (
+    "- `<file path=\"...\">` 与 `</file>` 之间直接写源码，不要外层再套 Markdown ``` 围栏。\n"
+)
+
+_DEV_COMPLETION_RULES_CN = (
+    "- 若用户需求依赖运行或抓取结果，请先用 `<tool>` 得到可核对输出并在正文中概括；"
+    "勿在未执行工具时仅贴脚本就打 `[完成]`。\n"
+)
+
+
 # --------------------------------------------------------------------------- #
 # 按 TaskMode 区分的输出格式规则（中文）
 # --------------------------------------------------------------------------- #
@@ -79,6 +96,9 @@ _OUTPUT_RULES: Dict[TaskMode, str] = {
         "- 源代码必须放在 `<file path=\"相对/路径.py\">...</file>` 标签内。\n"
         "- `path` 始终是相对于项目工作空间的相对路径，不允许绝对路径或 `..`。\n"
         "- 工具调用必须使用 `<tool name=\"<工具名>\">{JSON 参数}</tool>`。\n"
+        f"{_TOOL_JSON_RULES_CN}"
+        f"{_FILE_BODY_RULES_CN}"
+        f"{_DEV_COMPLETION_RULES_CN}"
         "- `<thought>...</thought>` 块可选；遇到非平凡推理时鼓励使用。"
     ),
     TaskMode.PHILOSOPHY: (
@@ -87,6 +107,8 @@ _OUTPUT_RULES: Dict[TaskMode, str] = {
         "用于展示你的推理链条。\n"
         "- 实证脚本必须放在 `<file path=\"相对/路径.py\">...</file>` 标签内。\n"
         "- 工具调用必须使用 `<tool name=\"<工具名>\">{JSON 参数}</tool>`。\n"
+        f"{_TOOL_JSON_RULES_CN}"
+        f"{_FILE_BODY_RULES_CN}"
         "- 把工具返回的数据视为证据；任何统计数字都不允许凭空编造。"
     ),
 }

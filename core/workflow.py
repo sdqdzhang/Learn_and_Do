@@ -33,7 +33,6 @@ from core.audit import (
     KIND_GUARD_PREFLIGHT,
     KIND_HUMAN_OVERRIDE,
     KIND_INTERVENTION_SUSPEND,
-    KIND_MULTI_REFLECTION,
     KIND_PROMPT,
     KIND_REFLECTION,
     KIND_RESPONSE,
@@ -44,6 +43,7 @@ from core.audit import (
 )
 from core.exceptions import (
     CodeFormatError,
+    EmptyAssistantReplyError,
     EvidenceConflict,
     FatalError,
     LLMTimeoutError,
@@ -51,8 +51,10 @@ from core.exceptions import (
     TinyDevinError,
 )
 from core.repair_guard import (
+    OUTBOUND_POST_TOOL_SYSTEM,
     OUTBOUND_SYSTEM,
     PREFLIGHT_SYSTEM,
+    build_outbound_post_tool_user,
     build_outbound_user,
     build_preflight_user,
     extract_json_verdict,
@@ -110,6 +112,8 @@ class WorkflowConfig:
     guard_outbound_enabled: bool = False
     guard_max_rounds: int = 2
     guard_model: Optional[str] = None
+    # 模型偶发只吐空白时，在单轮内额外重试 chat（不先写入 assistant）。
+    empty_reply_max_retries: int = 2
 
     @classmethod
     def from_env(cls, *, role: Optional[AgentRole] = None) -> "WorkflowConfig":
@@ -133,6 +137,10 @@ class WorkflowConfig:
         gmr = int(os.getenv("WORKFLOW_GUARD_MAX_ROUNDS", "2"))
         gmr = max(1, min(gmr, 5))
         gmodel = os.getenv("WORKFLOW_GUARD_MODEL", "").strip() or None
+        raw_empty = os.getenv("WORKFLOW_EMPTY_REPLY_MAX_RETRIES", "").strip()
+        empty_retries = 2
+        if raw_empty.isdigit():
+            empty_retries = max(0, min(8, int(raw_empty)))
         return cls(
             max_turns=int(os.getenv("WORKFLOW_MAX_TURNS", "10")),
             role=role or AgentRole.CODER,
@@ -144,6 +152,7 @@ class WorkflowConfig:
             guard_outbound_enabled=go,
             guard_max_rounds=gmr,
             guard_model=gmodel,
+            empty_reply_max_retries=empty_retries,
         )
 
 
@@ -208,12 +217,21 @@ class Workflow:
                 parsed = self._parse_reply(reply)
                 reply, parsed = self._maybe_preflight_guard(reply, parsed)
 
-                acted = self._maybe_act(parsed)
+                acted, tools_all_ok = self._maybe_act(parsed)
+
+                # 常见误用：同一轮里先 `<tool>` 再写 `[完成]`。工具跑完后本轮已具备收尾语义，
+                # 若仍等反思 JSON 里的 done，会在 max_turns 较小时直接耗尽循环并 FAILED。
+                if acted and tools_all_ok and self._is_terminal_reply(reply, parsed):
+                    return self._finalize_done(reply)
 
                 if self._is_terminal_reply(reply, parsed) and not acted:
                     proceed, reply, parsed = self._maybe_outbound_guard(reply, parsed, acted)
                     if not proceed:
                         continue
+                    return self._finalize_done(reply)
+
+                finish_natural, reply, parsed = self._maybe_post_tool_natural_done(reply, parsed, acted)
+                if finish_natural:
                     return self._finalize_done(reply)
 
                 self._reflect(parsed, acted)
@@ -251,10 +269,29 @@ class Workflow:
 
     def _think(self) -> str:
         self._transition(AgentState.THINKING)
-        try:
-            reply, usage = self._llm.chat_with_usage(self._context.to_openai())
-        except LLMTimeoutError:
-            raise
+        reply = ""
+        usage: Dict[str, Any] = {}
+        attempts = self._config.empty_reply_max_retries + 1
+        got_nonempty = False
+        for attempt in range(attempts):
+            try:
+                reply, usage = self._llm.chat_with_usage(self._context.to_openai())
+            except LLMTimeoutError:
+                raise
+            if (reply or "").strip():
+                got_nonempty = True
+                break
+            if attempt + 1 < attempts:
+                logger.warning(
+                    "assistant 返回空正文，即将发起同轮内第 %s 次补充 LLM 调用（本轮最多 %s 次）",
+                    attempt + 2,
+                    attempts,
+                )
+        if not got_nonempty:
+            raise EmptyAssistantReplyError(
+                "模型在空正文重试预算内持续返回空或仅空白内容",
+                details={"attempts": attempts, "last_usage": usage},
+            )
         parsed = parse_response(reply, mode=self._mode, require_block=False)
         self._trace.log(
             KIND_RESPONSE,
@@ -310,9 +347,14 @@ class Workflow:
         except CodeFormatError:
             raise
 
-    def _maybe_act(self, parsed: ParsedOutput) -> bool:
+    def _maybe_act(self, parsed: ParsedOutput) -> tuple[bool, bool]:
+        """执行本轮解析出的工具调用。
+
+        返回 ``(acted, all_tools_succeeded)``：未调用任何工具时为 ``(False, True)``；
+        有工具时 ``acted`` 为 True，``all_tools_succeeded`` 表示本轮**每一个**工具结果均为成功。
+        """
         if not parsed.tool_calls:
-            return False
+            return False, True
 
         self._transition(AgentState.ACTING)
         results = []
@@ -355,7 +397,8 @@ class Workflow:
         for result in results:
             if result.status is ToolStatus.FAILED:
                 logger.info("工具 %s 失败，将进入反思阶段", result.name)
-        return True
+        all_ok = all(r.status is ToolStatus.SUCCESS for r in results)
+        return True, all_ok
 
     def _reflect(self, parsed: ParsedOutput, acted: bool) -> None:
         self._transition(AgentState.REFLECTING)
@@ -365,27 +408,51 @@ class Workflow:
         for block in parsed.json_blocks:
             if "next_action" in block:
                 decision = str(block.get("next_action", "")).lower().strip()
-                reflection_block = block
-                self._trace.log(
-                    KIND_REFLECTION,
-                    block,
-                    state=self._state,
-                    turn=self._turn,
-                    context=self._context,
-                )
+                reflection_block = dict(block)
                 break
 
+        multi_bundle: Optional[Dict[str, Any]] = None
         if self._config.multi_reflection_roles:
-            decision = self._merge_multi_reflection(decision, reflection_block, parsed, acted)
+            decision, multi_bundle = self._merge_multi_reflection(
+                decision, reflection_block, parsed, acted
+            )
 
         override = self._maybe_human_intervention(phase="post_reflect")
         if override is not None:
             decision = override
 
-        if decision == "done":
+        effective = decision if decision in ("retry", "revise", "done") else "retry"
+        implicit_primary = reflection_block is None
+
+        summary = self._format_reflection_trace_summary(
+            effective_next_action=effective,
+            implicit_primary=implicit_primary,
+            acted=acted,
+            reflection_block=reflection_block,
+            multi_bundle=multi_bundle,
+        )
+        trace_payload: Dict[str, Any] = {
+            "effective_next_action": effective,
+            "implicit_primary": implicit_primary,
+            "acted": acted,
+            "summary": summary,
+        }
+        if reflection_block is not None:
+            trace_payload["structured_block"] = reflection_block
+        if multi_bundle is not None:
+            trace_payload["multi_reflection_bundle"] = multi_bundle
+        self._trace.log(
+            KIND_REFLECTION,
+            trace_payload,
+            state=self._state,
+            turn=self._turn,
+            context=self._context,
+        )
+
+        if effective == "done":
             self._state = AgentState.DONE
             return
-        if decision == "revise":
+        if effective == "revise":
             self._context.add(
                 ChatMessage(
                     role=MessageRole.SYSTEM,
@@ -393,9 +460,37 @@ class Workflow:
                 )
             )
             return
-        if decision == "retry":
-            return
         return
+
+    def _format_reflection_trace_summary(
+        self,
+        *,
+        effective_next_action: str,
+        implicit_primary: bool,
+        acted: bool,
+        reflection_block: Optional[dict],
+        multi_bundle: Optional[Dict[str, Any]],
+    ) -> str:
+        parts: list[str] = [f"有效决策：{effective_next_action}"]
+        parts.append(f"本轮已执行工具：{'是' if acted else '否'}")
+        if implicit_primary:
+            parts.append(
+                "主助手未输出含 next_action 的 JSON 反思块；结论由默认策略或多角色反思收敛。"
+            )
+        obs = (reflection_block or {}).get("observations")
+        if obs and str(obs).strip():
+            parts.append(f"observations：{str(obs).strip()[:520]}")
+        items = (multi_bundle or {}).get("items") or []
+        if items:
+            parts.append("多角色汇总：")
+            for raw in items:
+                r = raw.get("role")
+                if isinstance(r, dict) and "value" in r:
+                    r = r["value"]
+                r = str(r)
+                na = raw.get("next_action", "?")
+                parts.append(f"  · {r} → {na}")
+        return "\n".join(parts)
 
     def _merge_multi_reflection(
         self,
@@ -403,8 +498,12 @@ class Workflow:
         reflection_block: Optional[dict],
         parsed: ParsedOutput,
         acted: bool,
-    ) -> Optional[str]:
-        """多角色反思；``next_action`` 不一致时抛出 :class:`EvidenceConflict`。"""
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """多角色反思；``next_action`` 不一致时抛出 :class:`EvidenceConflict`。
+
+        不再单独写 ``multi_reflection`` 轨迹行；由 :meth:`_reflect` 合并进
+        同一条 ``reflection`` 事件。
+        """
         items: list[RoleReflection] = []
         if primary_decision and primary_decision in ("retry", "revise", "done"):
             rb = reflection_block or {}
@@ -428,24 +527,18 @@ class Workflow:
             )
 
         bundle = MultiReflectionBundle(items=items)
-        self._trace.log(
-            KIND_MULTI_REFLECTION,
-            bundle.model_dump(mode="json"),
-            state=self._state,
-            turn=self._turn,
-            context=self._context,
-        )
+        dumped: Dict[str, Any] = bundle.model_dump(mode="json")
 
         actions = [it.next_action for it in items if it.next_action in ("retry", "revise", "done")]
         if not actions:
-            return primary_decision
+            return primary_decision, dumped
         unique = set(actions)
         if len(unique) > 1:
             raise EvidenceConflict(
                 "多角色反思对 next_action 结论不一致",
-                details={"bundle": bundle.model_dump(mode="json")},
+                details={"bundle": dumped},
             )
-        return actions[0]
+        return actions[0], dumped
 
     def _reflect_as_role(self, role: AgentRole, parsed: ParsedOutput, acted: bool) -> str:
         """为附加角色单独发起一次短反思 LLM 调用。"""
@@ -530,12 +623,26 @@ class Workflow:
                 f"[反馈] 检测到冲突：{exc}。"
                 "请基于新证据，重新审视先前的主张并调整下一步行动。"
             )
-        if isinstance(exc, CodeFormatError):
+        if isinstance(exc, EmptyAssistantReplyError):
             return (
+                f"[反馈] {exc}。"
+                "请本轮输出非空、可解析的结构化内容（`<file>` / `<thought>` / `<tool>` / "
+                "```json``` 代码块），继续完成用户任务。"
+            )
+        if isinstance(exc, CodeFormatError):
+            base = (
                 f"[反馈] 你上一轮的响应无法被解析（{exc}）。"
                 "请严格按照系统提示中规定的结构化标签格式（<file> / "
                 "<thought> / <tool> / ```json``` 代码块）重新作答。"
             )
+            msg = str(exc)
+            if "不是合法的 JSON" in msg or "合法的 JSON" in msg:
+                base += (
+                    " 若 `<tool>` 的 `code` 含多行，勿在 JSON 里写 Python 三引号；"
+                    "可把 JSON 整体包在 CDATA 中，例如 "
+                    "`<tool name=\"python_repl\"><![CDATA[{\"code\":\"import os\\\\nprint(1)\"}]]></tool>`。"
+                )
+            return base
         suffix = f" 细节：{details}" if details else ""
         return f"[反馈] 可重试失败（{kind}）：{exc}。{suffix}"
 
@@ -551,12 +658,61 @@ class Workflow:
             return c
         return ""
 
+    def _preceding_message_is_successful_tool(self) -> bool:
+        """当前最后一条为 assistant 时，判断其前一条是否为「工具成功」消息。"""
+        msgs = self._context.messages()
+        if len(msgs) < 2:
+            return False
+        if msgs[-1].role is not MessageRole.ASSISTANT:
+            return False
+        prev = msgs[-2]
+        if prev.role is not MessageRole.TOOL:
+            return False
+        c = prev.content or ""
+        return "[工具" in c and "成功" in c
+
+    def _guard_transcript_excerpt(self) -> str:
+        """供出站校验模型参考的最近对话摘录（不含本轮 assistant 正文）。"""
+        msgs = self._context.messages()
+        if not msgs:
+            return ""
+        body = msgs[:-1] if msgs[-1].role is MessageRole.ASSISTANT else msgs
+        lines: list[str] = []
+        for m in body[-18:]:
+            role = m.role.value
+            c = (m.content or "").strip()
+            if len(c) > 1200:
+                c = c[:1200] + "…"
+            lines.append(f"[{role}]\n{c}")
+        return "\n\n".join(lines)
+
     def _guard_chat(self, system: str, user: str) -> str:
         messages = [
             ChatMessage(role=MessageRole.SYSTEM, content=system),
             ChatMessage(role=MessageRole.USER, content=user),
         ]
-        return self._llm.chat(messages, model=self._config.guard_model)
+        payload = [m.to_openai() for m in messages]
+        return self._llm.chat(payload, model=self._config.guard_model)
+
+    def _guard_chat_outbound(self, system: str, user: str) -> str:
+        """出站校验专用：优先使用 JSON object 模式以提高可解析性；不支持时回退普通 chat。"""
+        messages = [
+            ChatMessage(role=MessageRole.SYSTEM, content=system),
+            ChatMessage(role=MessageRole.USER, content=user),
+        ]
+        payload = [m.to_openai() for m in messages]
+        m = self._config.guard_model
+        try:
+            return self._llm.chat(
+                payload,
+                model=m,
+                temperature=0.0,
+                max_tokens=900,
+                extra={"response_format": {"type": "json_object"}},
+            )
+        except Exception as exc:  # noqa: BLE001 — 兼容不支持 response_format 的后端
+            logger.warning("出站 guard 使用 response_format=json_object 失败（%s），回退普通调用", exc)
+            return self._llm.chat(payload, model=m, temperature=0.0, max_tokens=900)
 
     def _maybe_preflight_guard(self, reply: str, parsed: ParsedOutput) -> Tuple[str, ParsedOutput]:
         """工具执行前：独立模型会话尝试把 assistant 正文修到可解析且工具名合法。"""
@@ -622,43 +778,72 @@ class Workflow:
             details={"last_error": str(last_err) if last_err else None, "snippet": reply[:400]},
         )
 
-    def _maybe_outbound_guard(
+    def _maybe_post_tool_natural_done(
         self,
         reply: str,
         parsed: ParsedOutput,
         acted: bool,
     ) -> Tuple[bool, str, ParsedOutput]:
-        """在「终止哨兵且本轮未执行工具」时：独立模型判断是否假完成；不通过则注入 SYSTEM 并继续主循环。"""
+        """工具已成功、本轮为自然语言收束且无 ``[完成]``：启发式或出站模型决定是否直接 DONE。"""
+        if acted or parsed.tool_calls:
+            return False, reply, parsed
+        if self._is_terminal_reply(reply, parsed):
+            return False, reply, parsed
+        if not (reply or "").strip():
+            return False, reply, parsed
+        if not self._preceding_message_is_successful_tool():
+            return False, reply, parsed
+
         if not self._config.guard_outbound_enabled:
-            return True, reply, parsed
-        if not (self._is_terminal_reply(reply, parsed) and not acted):
             return True, reply, parsed
 
         user_goal = self._last_user_goal()
+        transcript = self._guard_transcript_excerpt()
+        user = build_outbound_post_tool_user(
+            assistant_reply=reply,
+            mode=self._mode,
+            user_goal=user_goal,
+            transcript_tail=transcript,
+        )
+
+        diag_lines: list[str] = []
+        raw_snippets: list[str] = []
+
         for attempt in range(1, self._config.guard_max_rounds + 1):
-            user = build_outbound_user(
-                assistant_reply=reply,
-                mode=self._mode,
-                user_goal=user_goal,
-                acted=acted,
-            )
             try:
-                raw = self._guard_chat(OUTBOUND_SYSTEM, user)
+                raw = self._guard_chat_outbound(OUTBOUND_POST_TOOL_SYSTEM, user)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("guard outbound LLM 调用失败：%s", exc)
+                logger.warning("post-tool 出站 guard 调用失败：%s", exc)
+                diag_lines.append(f"第 {attempt} 次：HTTP/网络失败 — {exc!s}")
                 self._trace.log(
                     KIND_GUARD_OUTBOUND,
-                    {"ok": False, "attempt": attempt, "error": str(exc)},
+                    {
+                        "ok": False,
+                        "attempt": attempt,
+                        "error": str(exc),
+                        "variant": "post_tool_natural",
+                    },
                     state=self._state,
                     turn=self._turn,
                     context=self._context,
                 )
                 break
+
+            raw_snippets.append(raw[:2400])
             verdict = extract_json_verdict(raw)
             if verdict is None:
+                preview = (raw[:480] + "…") if len(raw) > 480 else raw
+                diag_lines.append(
+                    f"第 {attempt} 次：无法解析为含 allow_session_done 的 JSON。节选：{preview!r}"
+                )
                 self._trace.log(
                     KIND_GUARD_OUTBOUND,
-                    {"ok": False, "attempt": attempt, "error": "no_json_verdict"},
+                    {
+                        "ok": False,
+                        "attempt": attempt,
+                        "error": "no_json_verdict",
+                        "variant": "post_tool_natural",
+                    },
                     state=self._state,
                     turn=self._turn,
                     context=self._context,
@@ -675,18 +860,20 @@ class Workflow:
                     try:
                         parsed = parse_response(replacement, mode=self._mode, require_block=False)
                     except CodeFormatError as exc:
-                        self._context.add(
-                            ChatMessage(
-                                role=MessageRole.SYSTEM,
-                                content=f"[出站校验] 替换稿仍无法解析：{exc}",
-                            )
+                        fb = (
+                            "[出站校验]\n"
+                            "「工具后收束」校验给出的 `assistant_replacement` 无法被主流程解析。\n\n"
+                            f"解析错误：{exc}\n\n"
+                            "请重新输出自然语言结论或合规 `<tool>` / `<file>`，必要时在末尾加 `[完成]`。"
                         )
+                        self._context.add(ChatMessage(role=MessageRole.SYSTEM, content=fb))
                         self._trace.log(
                             KIND_GUARD_OUTBOUND,
                             {
                                 "ok": False,
                                 "attempt": attempt,
                                 "error": "replacement_parse_failed",
+                                "variant": "post_tool_natural",
                             },
                             state=self._state,
                             turn=self._turn,
@@ -701,6 +888,7 @@ class Workflow:
                     "attempt": attempt,
                     "allow_session_done": allow,
                     "feedback": feedback[:500],
+                    "variant": "post_tool_natural",
                 },
                 state=self._state,
                 turn=self._turn,
@@ -709,21 +897,190 @@ class Workflow:
             if allow:
                 return True, reply, parsed
 
-            note = feedback or (
-                "出站校验未通过：请继续完成任务，仅在真正完成后使用 [完成] 标记。"
+            reason = feedback or "（校验器未给出具体原因。）"
+            note = (
+                "[出站校验]\n"
+                "场景：工具已成功，本轮仅为自然语言收束且未写 `[完成]`。"
+                "校验器判定**尚不应**结束会话。\n\n"
+                f"原因：{reason}\n\n"
+                "请继续：若需再跑工具请输出 `<tool>`；若需改代码请用 `<file>`；"
+                "若已充分收束请在末尾加 `[完成]`。"
             )
-            self._context.add(ChatMessage(role=MessageRole.SYSTEM, content=f"[出站校验]\n{note}"))
+            self._context.add(ChatMessage(role=MessageRole.SYSTEM, content=note))
             return False, reply, parsed
 
-        self._context.add(
-            ChatMessage(
-                role=MessageRole.SYSTEM,
-                content="[出站校验]\n模型未返回合法 JSON 结论，本轮不允结束；请继续。",
-            )
-        )
+        # 工具已成功 + 自然语言复述：解析失败时倾向放行结束，避免无意义多轮。
         self._trace.log(
             KIND_GUARD_OUTBOUND,
-            {"ok": False, "fallback": True},
+            {
+                "ok": True,
+                "fallback": True,
+                "variant": "post_tool_natural",
+                "note": "限次内无可用 JSON 裁决，工具已成功故默认 allow_session_done",
+                "diagnostics": diag_lines[:12],
+            },
+            state=self._state,
+            turn=self._turn,
+            context=self._context,
+        )
+        return True, reply, parsed
+
+    def _maybe_outbound_guard(
+        self,
+        reply: str,
+        parsed: ParsedOutput,
+        acted: bool,
+    ) -> Tuple[bool, str, ParsedOutput]:
+        """在「终止哨兵且本轮未执行工具」时：独立模型判断是否假完成；不通过则注入 SYSTEM 并继续主循环。"""
+        if not self._config.guard_outbound_enabled:
+            return True, reply, parsed
+        if not (self._is_terminal_reply(reply, parsed) and not acted):
+            return True, reply, parsed
+
+        user_goal = self._last_user_goal()
+        diag_lines: list[str] = []
+        raw_snippets: list[str] = []
+
+        for attempt in range(1, self._config.guard_max_rounds + 1):
+            user = build_outbound_user(
+                assistant_reply=reply,
+                mode=self._mode,
+                user_goal=user_goal,
+                acted=acted,
+                transcript_tail=self._guard_transcript_excerpt(),
+            )
+            try:
+                raw = self._guard_chat_outbound(OUTBOUND_SYSTEM, user)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("guard outbound LLM 调用失败：%s", exc)
+                line = f"第 {attempt} 次：校验模型 HTTP/网络调用失败 — {exc!s}"
+                diag_lines.append(line)
+                self._trace.log(
+                    KIND_GUARD_OUTBOUND,
+                    {
+                        "ok": False,
+                        "attempt": attempt,
+                        "error": str(exc),
+                        "variant": "terminal_marker",
+                    },
+                    state=self._state,
+                    turn=self._turn,
+                    context=self._context,
+                )
+                break
+
+            raw_snippets.append(raw[:2400])
+            verdict = extract_json_verdict(raw)
+            if verdict is None:
+                preview = (raw[:480] + "…") if len(raw) > 480 else raw
+                diag_lines.append(
+                    f"第 {attempt} 次：校验模型已返回文本，但无法解析为含 "
+                    f"`allow_session_done` / `assistant_replacement` / `feedback` 的 JSON 对象。"
+                    f"（已尝试 ```json``` 围栏、整段解析与首部花括号配平。输出节选见下方。）"
+                )
+                diag_lines.append(f"输出节选：{preview!r}")
+                self._trace.log(
+                    KIND_GUARD_OUTBOUND,
+                    {
+                        "ok": False,
+                        "attempt": attempt,
+                        "error": "no_json_verdict",
+                        "variant": "terminal_marker",
+                    },
+                    state=self._state,
+                    turn=self._turn,
+                    context=self._context,
+                )
+                continue
+
+            allow = bool(verdict.get("allow_session_done"))
+            replacement = str(verdict.get("assistant_replacement", "") or "").strip()
+            feedback = str(verdict.get("feedback", "") or "").strip()
+
+            if replacement:
+                if self._context.replace_last_assistant_content(replacement):
+                    reply = replacement
+                    try:
+                        parsed = parse_response(replacement, mode=self._mode, require_block=False)
+                    except CodeFormatError as exc:
+                        fb = (
+                            "[出站校验]\n"
+                            "校验器给出了 `assistant_replacement` 替换稿，但主流程无法解析该替换稿为合法结构化回复。\n\n"
+                            f"解析错误：{exc}\n\n"
+                            "请在本轮重新输出：保留任务实质内容，修正 `<file>` / `<tool>` / JSON 块格式后再视情况使用 `[完成]`。"
+                        )
+                        self._context.add(ChatMessage(role=MessageRole.SYSTEM, content=fb))
+                        self._trace.log(
+                            KIND_GUARD_OUTBOUND,
+                            {
+                                "ok": False,
+                                "attempt": attempt,
+                                "error": "replacement_parse_failed",
+                                "variant": "terminal_marker",
+                            },
+                            state=self._state,
+                            turn=self._turn,
+                            context=self._context,
+                        )
+                        return False, reply, parsed
+
+            self._trace.log(
+                KIND_GUARD_OUTBOUND,
+                {
+                    "ok": True,
+                    "attempt": attempt,
+                    "allow_session_done": allow,
+                    "feedback": feedback[:500],
+                    "variant": "terminal_marker",
+                },
+                state=self._state,
+                turn=self._turn,
+                context=self._context,
+            )
+            if allow:
+                return True, reply, parsed
+
+            reason = feedback or "（校验器未给出具体文字原因，但判定为尚不应结束本轮会话。）"
+            note = (
+                "[出站校验]\n"
+                "结论：**不允许**在本轮使用 `[完成]` / 终止哨兵结束会话。\n\n"
+                f"原因：{reason}\n\n"
+                "请根据上述原因继续：若仍需执行沙箱/读写，请输出合法 `<tool name=\"...\">{{...}}</tool>`；"
+                "若需提交代码请用 `<file path=\"相对路径.py\">...</file>`。"
+                "若你认为任务已由**更早轮次的工具结果**满足，可用一两句自然语言复述该结果；"
+                "确认无需再改时再在末尾加 `[完成]`。"
+            )
+            self._context.add(ChatMessage(role=MessageRole.SYSTEM, content=note))
+            return False, reply, parsed
+
+        last_raw = raw_snippets[-1] if raw_snippets else ""
+        raw_block = ""
+        if last_raw.strip():
+            shown = last_raw[:1600] + ("…" if len(last_raw) > 1600 else "")
+            raw_block = f"\n### 校验模型原始输出（节选，便于排查格式；请勿逐字照抄到工具参数中）\n```text\n{shown}\n```\n"
+
+        detail_body = "\n".join(f"- {ln}" for ln in diag_lines) if diag_lines else "- （无逐次记录）"
+        fallback = (
+            "[出站校验]\n"
+            "独立「出站校验」模型在限次调用内**未能返回可解析的 JSON 裁决**，"
+            "因此系统无法自动判断你上一轮使用 `[完成]` 是否合理；按安全策略，本轮**不视为已结束**。\n\n"
+            "### 诊断（逐次）\n"
+            f"{detail_body}\n"
+            "### 请你接下来这样做\n"
+            "- 若用户需求已由**先前工具成功输出**满足：用一两句自然语言复述结果；确认无需再改代码或再跑工具后，再在末尾加 `[完成]`。\n"
+            "- 若仍需计算/读写/执行：输出合规 `<tool>` 或 `<file>`，**不要**在缺工具时单独写 `[完成]`。\n"
+            "- 若校验模型输出格式异常：你可写一句说明「上一轮已完成」，并附上要点，便于人类排查。"
+            f"{raw_block}"
+        )
+        self._context.add(ChatMessage(role=MessageRole.SYSTEM, content=fallback))
+        self._trace.log(
+            KIND_GUARD_OUTBOUND,
+            {
+                "ok": False,
+                "fallback": True,
+                "diagnostics": diag_lines[:12],
+                "variant": "terminal_marker",
+            },
             state=self._state,
             turn=self._turn,
             context=self._context,

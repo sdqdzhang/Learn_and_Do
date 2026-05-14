@@ -30,14 +30,14 @@ export default function CognitiveNode({ data }: Props) {
         : emptyBodyFallback;
 
   return (
-    <div className="w-[300px] rounded-lg border-2 border-slate-600 bg-gradient-to-br from-slate-900/95 via-slate-800/95 to-slate-900/90 px-3 py-2.5 text-slate-100 shadow-lg shadow-slate-950/40">
-      <Handle type="target" position={Position.Left} id="in-l" className="!h-2 !w-2 !bg-slate-400" />
-      <Handle type="target" position={Position.Right} id="in-r" className="!h-2 !w-2 !bg-slate-400" />
-      <Handle type="source" position={Position.Left} id="out-l" className="!h-2 !w-2 !bg-emerald-400" />
-      <Handle type="source" position={Position.Right} id="out-r" className="!h-2 !w-2 !bg-sky-400" />
+    <div className="w-[300px] rounded-lg border-2 border-emerald-700/45 bg-gradient-to-br from-slate-900/95 via-emerald-950/12 to-slate-900/90 px-3 py-2.5 text-slate-100 shadow-lg shadow-slate-950/40">
+      <Handle type="target" position={Position.Left} id="in-l" className="!h-2 !w-2 !bg-emerald-500/60" />
+      <Handle type="target" position={Position.Right} id="in-r" className="!h-2 !w-2 !bg-emerald-500/60" />
+      <Handle type="source" position={Position.Left} id="out-l" className="!h-2 !w-2 !bg-emerald-400/75" />
+      <Handle type="source" position={Position.Right} id="out-r" className="!h-2 !w-2 !bg-sky-400/70" />
 
-      <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-sky-300/90">
-        认知 · Thought
+      <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-emerald-200/85">
+        思考 · Think
       </div>
       <ul className="max-h-[140px] space-y-1.5 overflow-y-auto text-xs leading-snug text-slate-200">
         {lines.map((t, i) => (

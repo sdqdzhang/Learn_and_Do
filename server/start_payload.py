@@ -190,6 +190,8 @@ def merge_workflow_config(
         if raw.get("guard_model") is not None:
             gm = str(raw["guard_model"]).strip()
             overrides["guard_model"] = gm or None
+        if "infer_done_after_tool_reply" in raw:
+            overrides["infer_done_after_tool_reply"] = _truthy(raw["infer_done_after_tool_reply"])
     return replace(base, **overrides)
 
 
@@ -251,6 +253,7 @@ def public_server_defaults() -> Dict[str, Any]:
             "guard_outbound_enabled": wf.guard_outbound_enabled,
             "guard_max_rounds": wf.guard_max_rounds,
             "guard_model": wf.guard_model,
+            "infer_done_after_tool_reply": wf.infer_done_after_tool_reply,
         },
         "session": {
             "name_prefix": ss.name_prefix,

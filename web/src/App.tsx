@@ -16,6 +16,7 @@ import { DataFlowEdge } from "./components/edges/DataFlowEdge";
 import CognitiveNode from "./components/nodes/CognitiveNode";
 import ExecutionNode from "./components/nodes/ExecutionNode";
 import OutputNode from "./components/nodes/OutputNode";
+import ReflectionNode from "./components/nodes/ReflectionNode";
 import sampleTrace from "./mocks/sample_trace.jsonl?raw";
 import SettingsPage from "./settings/SettingsPage";
 import { useSettingsStore } from "./settings/store";
@@ -23,7 +24,12 @@ import { useTraceStore } from "./store/useTraceStore";
 import { ingestTraceEvent, ingestTraceJsonlLine, loadTraceJsonlDocument, resetTraceView, selectTraceNode } from "./trace";
 import type { TraceEvent } from "./types/trace";
 
-const nodeTypes = { cognitive: CognitiveNode, execution: ExecutionNode, output: OutputNode };
+const nodeTypes = {
+  cognitive: CognitiveNode,
+  execution: ExecutionNode,
+  output: OutputNode,
+  reflection: ReflectionNode,
+};
 const edgeTypes = { dataFlow: DataFlowEdge };
 
 function wsSessionUrl(): string {

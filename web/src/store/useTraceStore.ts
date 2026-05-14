@@ -5,6 +5,7 @@ import type {
   CognitiveNodeData,
   ExecutionNodeData,
   OutputNodeData,
+  ReflectionNodeData,
   TraceEvent,
 } from "../types/trace";
 import { edgePaint } from "../utils/edgeAppearance";
@@ -12,10 +13,59 @@ import { extractResponseTraceHints } from "../utils/responseTraceHints";
 import { extractThoughts, normalizeUsage } from "../utils/thoughtAdapter";
 import { extractToolOutputParts } from "../utils/toolOutput";
 
-const COG_X = 48;
-const EXEC_X = 560;
-const OUTPUT_X = 920;
+const COG_X = 40;
+const REFL_X = 404;
+const EXEC_X = 772;
+const OUTPUT_X = 1128;
 const ROW_GAP = 168;
+
+type AnyTraceNodeData = CognitiveNodeData | ExecutionNodeData | OutputNodeData | ReflectionNodeData;
+
+function yAlignedFromLastChain(
+  nodes: Node<AnyTraceNodeData>[],
+  last: ChainTip | null,
+  fallbackY: number,
+): number {
+  if (!last) return fallbackY;
+  const n = nodes.find((x) => x.id === last.nodeId);
+  return n ? n.position.y : fallbackY;
+}
+
+/** 将 reflection / 旧版 multi_reflection 载荷整理为单段画布正文。 */
+function reflectionSummaryFromPayload(kind: string, payload: Record<string, unknown>): string {
+  const direct = payload.summary;
+  if (typeof direct === "string" && direct.trim()) {
+    return direct.trimEnd().slice(0, 4000);
+  }
+  if (kind === "multi_reflection") {
+    const items = payload.items;
+    if (Array.isArray(items) && items.length) {
+      return items
+        .map((it) => {
+          const o = it as Record<string, unknown>;
+          const role = o.role;
+          const r =
+            role && typeof role === "object" && "value" in (role as object)
+              ? String((role as { value: unknown }).value)
+              : String(role ?? "?");
+          return `· ${r} → ${String(o.next_action ?? "?")}`;
+        })
+        .join("\n");
+    }
+  }
+  const parts: string[] = [];
+  if ("effective_next_action" in payload) {
+    parts.push(`有效决策：${String(payload.effective_next_action)}`);
+  } else if ("next_action" in payload) {
+    parts.push(`next_action: ${String(payload.next_action)}`);
+  }
+  const obs = payload.observations;
+  if (obs !== undefined && String(obs).trim()) {
+    parts.push(`observations: ${String(obs).slice(0, 520)}`);
+  }
+  if (parts.length) return parts.join("\n");
+  return JSON.stringify(payload, null, 1).slice(0, 1200);
+}
 
 function mapToolStatus(s: unknown): ExecutionNodeData["status"] {
   const v = String(s ?? "").toLowerCase();
@@ -24,36 +74,22 @@ function mapToolStatus(s: unknown): ExecutionNodeData["status"] {
   return "PENDING";
 }
 
+/** 所有边统一：从上一节点右侧出，进入下一节点左侧（左进右出）。 */
 function edgeHandles(
-  prev: ChainTip["variant"],
-  next: ChainTip["variant"],
+  _prev: ChainTip["variant"],
+  _next: ChainTip["variant"],
 ): { sourceHandle: string; targetHandle: string } {
-  if (prev === "cognitive" && next === "execution") {
-    return { sourceHandle: "out-r", targetHandle: "in-l" };
-  }
-  if (prev === "execution" && next === "output") {
-    return { sourceHandle: "out-r", targetHandle: "in-l" };
-  }
-  if (prev === "output" && next === "cognitive") {
-    return { sourceHandle: "out-l", targetHandle: "in-r" };
-  }
-  if (prev === "execution" && next === "cognitive") {
-    return { sourceHandle: "out-l", targetHandle: "in-r" };
-  }
-  if (prev === "cognitive" && next === "cognitive") {
-    return { sourceHandle: "out-r", targetHandle: "in-r" };
-  }
   return { sourceHandle: "out-r", targetHandle: "in-l" };
 }
 
 function attachOutputAfterExec(
-  nodes: Node<CognitiveNodeData | ExecutionNodeData | OutputNodeData>[],
+  nodes: Node<AnyTraceNodeData>[],
   edges: Edge[],
   edgeSeq: number,
   execId: string,
   event: TraceEvent,
 ): {
-  nodes: Node<CognitiveNodeData | ExecutionNodeData | OutputNodeData>[];
+  nodes: Node<AnyTraceNodeData>[];
   edges: Edge[];
   edgeSeq: number;
   lastChain: ChainTip;
@@ -128,7 +164,7 @@ function attachOutputAfterExec(
 }
 
 type TraceStore = {
-  nodes: Node<CognitiveNodeData | ExecutionNodeData | OutputNodeData>[];
+  nodes: Node<AnyTraceNodeData>[];
   edges: Edge[];
   lastChain: ChainTip | null;
   cognitiveRow: number;
@@ -176,7 +212,9 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
         ? (n.data as CognitiveNodeData).rawEvent
         : n.type === "output"
           ? (n.data as OutputNodeData).rawEvent
-          : (n.data as ExecutionNodeData).rawEvent;
+          : n.type === "reflection"
+            ? (n.data as ReflectionNodeData).rawEvent
+            : (n.data as ExecutionNodeData).rawEvent;
     set({ selectedEvent: raw });
   },
 
@@ -356,6 +394,50 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
           lastChain: attached.lastChain,
         };
       });
+    }
+
+    if (kind === "reflection" || kind === "multi_reflection") {
+      set((s) => {
+        const fallbackY = 32 + s.cognitiveRow * ROW_GAP;
+        const y = yAlignedFromLastChain(s.nodes, s.lastChain, fallbackY);
+        const id = `refl-${event.turn}-${Math.floor(event.ts * 1000) % 1_000_000}`;
+        const payload = event.payload as Record<string, unknown>;
+        const summary = reflectionSummaryFromPayload(kind, payload);
+        const node: Node<ReflectionNodeData> = {
+          id,
+          type: "reflection",
+          position: { x: REFL_X, y },
+          data: {
+            summary,
+            rawEvent: event,
+          },
+        };
+        const edges = [...s.edges];
+        let edgeSeq = s.edgeSeq;
+        if (s.lastChain) {
+          edgeSeq += 1;
+          const { sourceHandle, targetHandle } = edgeHandles(s.lastChain.variant, "reflection");
+          const paint = edgePaint(s.edges.length);
+          edges.push({
+            id: `e-${edgeSeq}`,
+            source: s.lastChain.nodeId,
+            target: id,
+            type: "dataFlow",
+            animated: false,
+            sourceHandle,
+            targetHandle,
+            style: { stroke: paint.stroke },
+            data: { curvature: paint.curvature },
+          });
+        }
+        return {
+          nodes: [...s.nodes, node],
+          edges,
+          edgeSeq,
+          lastChain: { nodeId: id, variant: "reflection" },
+        };
+      });
+      return;
     }
   },
 }));

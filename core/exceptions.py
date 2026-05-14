@@ -47,6 +47,10 @@ class CodeFormatError(RetryableError):
     """LLM 输出无法解析为 <file> / <thought> / <tool> / json 块。"""
 
 
+class EmptyAssistantReplyError(RetryableError):
+    """LLM 返回的 assistant 正文在重试预算内仍为空或仅空白。"""
+
+
 class MissingPathError(RetryableError):
     """找到了代码块但缺少 ``path`` 属性。"""
 
@@ -100,6 +104,7 @@ __all__ = [
     "RetryableError",
     "FatalError",
     "CodeFormatError",
+    "EmptyAssistantReplyError",
     "MissingPathError",
     "LLMTimeoutError",
     "EvidenceConflict",

@@ -25,16 +25,16 @@ export default function ExecutionNode({ data }: Props) {
   const short = snapshot.length > 180 ? `${snapshot.slice(0, 180)}…` : snapshot;
 
   return (
-    <div className="w-[320px] rounded-none border border-emerald-700/40 bg-slate-950/55 px-3 py-2.5 font-mono text-slate-100 shadow-[0_0_0_1px_rgba(16,185,129,0.12)] backdrop-blur-sm">
-      <Handle type="target" position={Position.Left} id="in-l" className="!h-2 !w-2 !bg-emerald-400" />
-      <Handle type="target" position={Position.Right} id="in-r" className="!h-2 !w-2 !bg-emerald-400" />
-      <Handle type="source" position={Position.Left} id="out-l" className="!h-2 !w-2 !bg-teal-300" />
-      <Handle type="source" position={Position.Right} id="out-r" className="!h-2 !w-2 !bg-teal-300" />
+    <div className="w-[320px] rounded-lg border-2 border-rose-800/40 bg-gradient-to-br from-slate-950/90 via-rose-950/10 to-slate-950/88 px-3 py-2.5 font-mono text-slate-100 shadow-lg shadow-slate-950/40">
+      <Handle type="target" position={Position.Left} id="in-l" className="!h-2 !w-2 !bg-rose-500/55" />
+      <Handle type="target" position={Position.Right} id="in-r" className="!h-2 !w-2 !bg-rose-500/55" />
+      <Handle type="source" position={Position.Left} id="out-l" className="!h-2 !w-2 !bg-rose-400/65" />
+      <Handle type="source" position={Position.Right} id="out-r" className="!h-2 !w-2 !bg-rose-300/60" />
 
-      <div className="mb-2 flex items-center justify-between gap-2 border-b border-slate-800 pb-1.5">
+      <div className="mb-2 flex items-center justify-between gap-2 border-b border-slate-800/90 pb-1.5">
         <div className="flex items-center gap-1.5 text-[11px] text-slate-300">
-          <Terminal className="h-3.5 w-3.5 shrink-0 text-emerald-400/90" aria-hidden />
-          <span className="truncate font-semibold text-emerald-100/95">{toolName}</span>
+          <Terminal className="h-3.5 w-3.5 shrink-0 text-rose-300/90" aria-hidden />
+          <span className="truncate font-semibold text-rose-50/95">{toolName}</span>
         </div>
         <StatusBadge status={status} />
       </div>
