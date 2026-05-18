@@ -96,6 +96,12 @@ class ChatMessage(BaseModel):
 
     def to_openai(self) -> Dict[str, Any]:
         """渲染成 openai SDK 期望的 dict 形态。"""
+        if self.role is MessageRole.TOOL:
+            # 本项目使用文本 `<tool>` 协议，而不是 OpenAI 原生 tool_calls；
+            # 因此再次发给模型时不能使用 role=tool，否则上游会要求前一条
+            # assistant 消息带原生 tool_calls 字段。
+            prefix = f"[工具结果 {self.tool_call_id}]\n" if self.tool_call_id else "[工具结果]\n"
+            return {"role": MessageRole.USER.value, "content": prefix + self.content}
         out: Dict[str, Any] = {"role": self.role.value, "content": self.content}
         if self.tool_call_id is not None:
             out["tool_call_id"] = self.tool_call_id

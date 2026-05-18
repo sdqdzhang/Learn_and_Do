@@ -1,6 +1,7 @@
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 
 import { SETTINGS_FIELD_TIPS as FT } from "./fieldTips";
+import { newLlmPresetId } from "./llmPresetMerge";
 import { useSettingsStore } from "./store";
 
 const inp =
@@ -33,6 +34,50 @@ type Props = { onBack: () => void };
 export default function SettingsPage({ onBack }: Props) {
   const s = useSettingsStore();
   const [syncMsg, setSyncMsg] = useState("");
+  const [newPresetLabel, setNewPresetLabel] = useState("");
+
+  const presetSelectValue = useMemo(() => {
+    const id = s.llm.activePresetId;
+    if (id && s.llm.llmEndpointPresets.some((p) => p.id === id)) return id;
+    return "";
+  }, [s.llm.activePresetId, s.llm.llmEndpointPresets]);
+
+  const applyPreset = (pr: (typeof s.llm.llmEndpointPresets)[number]) => {
+    s.patchLlm({
+      baseUrl: pr.baseUrl,
+      model: pr.model,
+      apiKey: pr.apiKey,
+      activePresetId: pr.id,
+    });
+  };
+
+  const addPresetFromForm = () => {
+    const label = newPresetLabel.trim() || s.llm.model.trim() || "未命名端点";
+    const baseUrl = s.llm.baseUrl.trim();
+    const model = s.llm.model.trim();
+    if (!baseUrl || !model) return;
+    const id = newLlmPresetId();
+    s.patchLlm({
+      llmEndpointPresets: [
+        ...s.llm.llmEndpointPresets,
+        { id, label, baseUrl, model, apiKey: s.llm.apiKey },
+      ],
+      activePresetId: id,
+    });
+    setNewPresetLabel("");
+  };
+
+  const updateActivePreset = () => {
+    const id = s.llm.activePresetId;
+    if (!id) return;
+    s.patchLlm({
+      llmEndpointPresets: s.llm.llmEndpointPresets.map((p) =>
+        p.id === id
+          ? { ...p, baseUrl: s.llm.baseUrl.trim(), model: s.llm.model.trim(), apiKey: s.llm.apiKey }
+          : p,
+      ),
+    });
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-slate-950 text-slate-100">
@@ -148,6 +193,30 @@ export default function SettingsPage({ onBack }: Props) {
           <section className="rounded-lg border border-slate-800 bg-slate-900/40 p-4">
             <h2 className={secTitle}>LLM（主对话与护栏共用同一 OpenAI 兼容端点）</h2>
             <div className="grid gap-3 sm:grid-cols-2">
+              <div className="sm:col-span-2">
+                <Lab title="端点预设（下拉填入 base_url / model / api_key）" tip={FT.llmPresetSelect}>
+                  <select
+                    className={inp}
+                    value={presetSelectValue}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      if (!v) {
+                        s.patchLlm({ activePresetId: null });
+                        return;
+                      }
+                      const pr = s.llm.llmEndpointPresets.find((p) => p.id === v);
+                      if (pr) applyPreset(pr);
+                    }}
+                  >
+                    <option value="">— 不使用预设（仅在下方手动编辑）—</option>
+                    {s.llm.llmEndpointPresets.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.label}
+                      </option>
+                    ))}
+                  </select>
+                </Lab>
+              </div>
               <Lab title="OLLAMA_BASE_URL / base_url" tip={FT.llmBaseUrl}>
                 <input className={inp} value={s.llm.baseUrl} onChange={(e) => s.patchLlm({ baseUrl: e.target.value })} />
               </Lab>
@@ -163,6 +232,73 @@ export default function SettingsPage({ onBack }: Props) {
               <Lab title="OLLAMA_MODEL" tip={FT.llmModel}>
                 <input className={inp} value={s.llm.model} onChange={(e) => s.patchLlm({ model: e.target.value })} />
               </Lab>
+              <div className="sm:col-span-2 flex flex-col gap-2 rounded border border-slate-800/80 bg-slate-950/50 p-3">
+                <span className="text-[10px] font-medium text-slate-500" title={FT.llmEndpointPresetsHint}>
+                  管理 OpenAI 兼容端点预设（仅本机浏览器；启动时仍只发送上方三项）
+                </span>
+                <div className="flex flex-wrap items-end gap-2">
+                  <label className="flex min-w-[10rem] flex-1 flex-col gap-0.5">
+                    <span className="text-[11px] text-slate-400">新预设显示名</span>
+                    <input
+                      className={inp}
+                      placeholder="例如 本机 Ollama / 公司网关"
+                      value={newPresetLabel}
+                      onChange={(e) => setNewPresetLabel(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          addPresetFromForm();
+                        }
+                      }}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="rounded border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 hover:bg-slate-800"
+                    onClick={addPresetFromForm}
+                  >
+                    将下方三项存为新预设
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!s.llm.activePresetId}
+                    className="rounded border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                    onClick={updateActivePreset}
+                  >
+                    写回当前选中预设
+                  </button>
+                </div>
+                {s.llm.llmEndpointPresets.length > 0 ? (
+                  <ul className="divide-y divide-slate-800/80 overflow-hidden rounded border border-slate-800/80">
+                    {s.llm.llmEndpointPresets.map((p) => (
+                      <li key={p.id} className="flex flex-wrap items-center gap-2 bg-slate-950/30 px-2 py-1.5 text-[11px]">
+                        <span className="font-medium text-slate-200">{p.label}</span>
+                        <span className="min-w-0 flex-1 truncate text-slate-500" title={`${p.model} · ${p.baseUrl}`}>
+                          {p.model} · {p.baseUrl}
+                        </span>
+                        <button
+                          type="button"
+                          className="shrink-0 rounded border border-slate-600 px-2 py-0.5 text-slate-300 hover:bg-slate-800"
+                          onClick={() => applyPreset(p)}
+                        >
+                          应用
+                        </button>
+                        <button
+                          type="button"
+                          className="shrink-0 rounded border border-slate-700 px-2 py-0.5 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+                          onClick={() => {
+                            const next = s.llm.llmEndpointPresets.filter((x) => x.id !== p.id);
+                            const nextActive = s.llm.activePresetId === p.id ? null : s.llm.activePresetId;
+                            s.patchLlm({ llmEndpointPresets: next, activePresetId: nextActive });
+                          }}
+                        >
+                          删除
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
               <Lab title="LLM_TIMEOUT_SECONDS" tip={FT.llmTimeout}>
                 <input
                   className={inp}

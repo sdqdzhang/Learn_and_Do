@@ -13,6 +13,8 @@ export function createDefaultSessionSettings(): SessionSettingsData {
       baseUrl: "http://localhost:11434/v1",
       apiKey: "ollama",
       model: "your-model-name",
+      activePresetId: null,
+      llmEndpointPresets: [],
       timeoutSeconds: 120,
       maxRetries: 2,
       temperature: 0.2,

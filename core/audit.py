@@ -39,6 +39,7 @@ KIND_HUMAN_OVERRIDE = "human_override"
 KIND_MULTI_REFLECTION = "multi_reflection"
 KIND_GUARD_PREFLIGHT = "guard_preflight"
 KIND_GUARD_OUTBOUND = "guard_outbound"
+KIND_FINAL_SUMMARY = "final_summary"
 
 
 class TraceLogger:
@@ -192,4 +193,5 @@ __all__ = [
     "KIND_MULTI_REFLECTION",
     "KIND_GUARD_PREFLIGHT",
     "KIND_GUARD_OUTBOUND",
+    "KIND_FINAL_SUMMARY",
 ]

@@ -74,12 +74,48 @@ function mapToolStatus(s: unknown): ExecutionNodeData["status"] {
   return "PENDING";
 }
 
+function guardPreflightSummaryFromPayload(payload: Record<string, unknown>): string {
+  const ok = payload.ok;
+  if (ok === null || payload.status === "pending") {
+    const reason = String(payload.reason ?? "");
+    const label = reason === "parse_error" ? "结构化解析失败" : "工具名未知";
+    return `正在工具预检...\n原因：${label}\n${String(payload.message ?? "")}`.trim();
+  }
+  if (ok === true) {
+    const summary = String(payload.tool_summary ?? "").trim();
+    return `工具预检完成：已修复并通过。\n${summary}`.trim();
+  }
+  return `工具预检失败：${String(payload.error ?? "未知错误")}`;
+}
+
 /** 所有边统一：从上一节点右侧出，进入下一节点左侧（左进右出）。 */
-function edgeHandles(
-  _prev: ChainTip["variant"],
-  _next: ChainTip["variant"],
-): { sourceHandle: string; targetHandle: string } {
-  return { sourceHandle: "out-r", targetHandle: "in-l" };
+const CHAIN_EDGE_HANDLES = {
+  sourceHandle: "out-r",
+  targetHandle: "in-l",
+} as const;
+
+/** 在已有 ``edges`` 副本上追加一条链路边（若有 ``lastChain``）；返回新的 ``edgeSeq``。 */
+function appendChainEdgeFromLast(
+  edges: Edge[],
+  edgeSeq: number,
+  lastChain: ChainTip | null,
+  targetNodeId: string,
+  edgeCountBeforeNewEdge: number,
+): number {
+  if (!lastChain) return edgeSeq;
+  const nextSeq = edgeSeq + 1;
+  const paint = edgePaint(edgeCountBeforeNewEdge);
+  edges.push({
+    id: `e-${nextSeq}`,
+    source: lastChain.nodeId,
+    target: targetNodeId,
+    type: "dataFlow",
+    animated: false,
+    ...CHAIN_EDGE_HANDLES,
+    style: { stroke: paint.stroke },
+    data: { curvature: paint.curvature },
+  });
+  return nextSeq;
 }
 
 function attachOutputAfterExec(
@@ -140,7 +176,6 @@ function attachOutputAfterExec(
   const hasEdge = nextEdges.some((e) => e.source === execId && e.target === outId);
   if (!hasEdge) {
     nextSeq += 1;
-    const { sourceHandle, targetHandle } = edgeHandles("execution", "output");
     const paint = edgePaint(edges.length);
     nextEdges.push({
       id: `e-${nextSeq}`,
@@ -148,8 +183,7 @@ function attachOutputAfterExec(
       target: outId,
       type: "dataFlow",
       animated: false,
-      sourceHandle,
-      targetHandle,
+      ...CHAIN_EDGE_HANDLES,
       style: { stroke: paint.stroke },
       data: { curvature: paint.curvature },
     });
@@ -171,7 +205,9 @@ type TraceStore = {
   executionRow: number;
   edgeSeq: number;
   selectedEvent: TraceEvent | null;
+  finalSummary: string | null;
   addEvent: (event: TraceEvent) => void;
+  setFinalSummary: (summary: string | null) => void;
   setSelectedFromNodeId: (nodeId: string | null) => void;
   reset: () => void;
 };
@@ -187,6 +223,7 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
   nodes: [],
   edges: [],
   selectedEvent: null,
+  finalSummary: null,
   ...initialLayout,
 
   reset: () =>
@@ -194,7 +231,13 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
       nodes: [],
       edges: [],
       selectedEvent: null,
+      finalSummary: null,
       ...initialLayout,
+    }),
+
+  setFinalSummary: (summary) =>
+    set({
+      finalSummary: summary && summary.trim() ? summary.trim() : null,
     }),
 
   setSelectedFromNodeId: (nodeId) => {
@@ -207,19 +250,35 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
       set({ selectedEvent: null });
       return;
     }
-    const raw =
-      n.type === "cognitive"
-        ? (n.data as CognitiveNodeData).rawEvent
-        : n.type === "output"
-          ? (n.data as OutputNodeData).rawEvent
-          : n.type === "reflection"
-            ? (n.data as ReflectionNodeData).rawEvent
-            : (n.data as ExecutionNodeData).rawEvent;
+    let raw: TraceEvent;
+    switch (n.type) {
+      case "cognitive":
+        raw = (n.data as CognitiveNodeData).rawEvent;
+        break;
+      case "output":
+        raw = (n.data as OutputNodeData).rawEvent;
+        break;
+      case "reflection":
+        raw = (n.data as ReflectionNodeData).rawEvent;
+        break;
+      case "execution":
+        raw = (n.data as ExecutionNodeData).rawEvent;
+        break;
+      default:
+        raw = (n.data as ExecutionNodeData).rawEvent;
+        break;
+    }
     set({ selectedEvent: raw });
   },
 
   addEvent: (event) => {
     const kind = event.kind;
+
+    if (kind === "final_summary") {
+      const summary = event.payload.summary;
+      set({ finalSummary: typeof summary === "string" && summary.trim() ? summary.trim() : null });
+      return;
+    }
 
     if (kind === "response") {
       set((s) => {
@@ -244,22 +303,7 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
         };
         const edges = [...s.edges];
         let edgeSeq = s.edgeSeq;
-        if (s.lastChain) {
-          edgeSeq += 1;
-          const { sourceHandle, targetHandle } = edgeHandles(s.lastChain.variant, "cognitive");
-          const paint = edgePaint(s.edges.length);
-          edges.push({
-            id: `e-${edgeSeq}`,
-            source: s.lastChain.nodeId,
-            target: id,
-            type: "dataFlow",
-            animated: false,
-            sourceHandle,
-            targetHandle,
-            style: { stroke: paint.stroke },
-            data: { curvature: paint.curvature },
-          });
-        }
+        edgeSeq = appendChainEdgeFromLast(edges, edgeSeq, s.lastChain, id, s.edges.length);
         return {
           nodes: [...s.nodes, node],
           edges,
@@ -295,22 +339,7 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
         };
         const edges = [...s.edges];
         let edgeSeq = s.edgeSeq;
-        if (s.lastChain) {
-          edgeSeq += 1;
-          const { sourceHandle, targetHandle } = edgeHandles(s.lastChain.variant, "execution");
-          const paint = edgePaint(s.edges.length);
-          edges.push({
-            id: `e-${edgeSeq}`,
-            source: s.lastChain.nodeId,
-            target: id,
-            type: "dataFlow",
-            animated: false,
-            sourceHandle,
-            targetHandle,
-            style: { stroke: paint.stroke },
-            data: { curvature: paint.curvature },
-          });
-        }
+        edgeSeq = appendChainEdgeFromLast(edges, edgeSeq, s.lastChain, id, s.edges.length);
         return {
           nodes: [...s.nodes, node],
           edges,
@@ -346,22 +375,7 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
           };
           const edges = [...s.edges];
           let edgeSeq = s.edgeSeq;
-          if (s.lastChain) {
-            edgeSeq += 1;
-            const { sourceHandle, targetHandle } = edgeHandles(s.lastChain.variant, "execution");
-            const paint = edgePaint(s.edges.length);
-            edges.push({
-              id: `e-${edgeSeq}`,
-              source: s.lastChain.nodeId,
-              target: id,
-              type: "dataFlow",
-              animated: false,
-              sourceHandle,
-              targetHandle,
-              style: { stroke: paint.stroke },
-              data: { curvature: paint.curvature },
-            });
-          }
+          edgeSeq = appendChainEdgeFromLast(edges, edgeSeq, s.lastChain, id, s.edges.length);
           const baseNodes = [...s.nodes, node];
           const attached = attachOutputAfterExec(baseNodes, edges, edgeSeq, id, event);
           return {
@@ -396,13 +410,16 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
       });
     }
 
-    if (kind === "reflection" || kind === "multi_reflection") {
+    if (kind === "reflection" || kind === "multi_reflection" || kind === "guard_preflight") {
       set((s) => {
         const fallbackY = 32 + s.cognitiveRow * ROW_GAP;
         const y = yAlignedFromLastChain(s.nodes, s.lastChain, fallbackY);
         const id = `refl-${event.turn}-${Math.floor(event.ts * 1000) % 1_000_000}`;
         const payload = event.payload as Record<string, unknown>;
-        const summary = reflectionSummaryFromPayload(kind, payload);
+        const summary =
+          kind === "guard_preflight"
+            ? guardPreflightSummaryFromPayload(payload)
+            : reflectionSummaryFromPayload(kind, payload);
         const node: Node<ReflectionNodeData> = {
           id,
           type: "reflection",
@@ -414,22 +431,7 @@ export const useTraceStore = create<TraceStore>((set, get) => ({
         };
         const edges = [...s.edges];
         let edgeSeq = s.edgeSeq;
-        if (s.lastChain) {
-          edgeSeq += 1;
-          const { sourceHandle, targetHandle } = edgeHandles(s.lastChain.variant, "reflection");
-          const paint = edgePaint(s.edges.length);
-          edges.push({
-            id: `e-${edgeSeq}`,
-            source: s.lastChain.nodeId,
-            target: id,
-            type: "dataFlow",
-            animated: false,
-            sourceHandle,
-            targetHandle,
-            style: { stroke: paint.stroke },
-            data: { curvature: paint.curvature },
-          });
-        }
+        edgeSeq = appendChainEdgeFromLast(edges, edgeSeq, s.lastChain, id, s.edges.length);
         return {
           nodes: [...s.nodes, node],
           edges,

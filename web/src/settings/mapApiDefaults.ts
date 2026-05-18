@@ -1,10 +1,15 @@
 import { createDefaultSessionSettings } from "./defaults";
+import { mergeLlmEndpointPresetsFromApi } from "./llmPresetMerge";
 import type { ApiSettingsResponse, SessionSettingsData } from "./types";
 
 /** 将 ``GET /api/settings`` 的 ``defaults`` 合并进当前 UI 形状（不覆盖 apiKey）。 */
-export function mergeApiDefaultsIntoSettings(api: ApiSettingsResponse["defaults"]): SessionSettingsData {
+export function mergeApiDefaultsIntoSettings(
+  api: ApiSettingsResponse["defaults"],
+  local?: SessionSettingsData | null,
+): SessionSettingsData {
   const base = createDefaultSessionSettings();
   const { llm, workflow, session, executor, context } = api;
+  const localPresets = local?.llm.llmEndpointPresets ?? [];
   return {
     ...base,
     maxTurns: String(workflow.max_turns ?? ""),
@@ -24,6 +29,8 @@ export function mergeApiDefaultsIntoSettings(api: ApiSettingsResponse["defaults"
       ...base.llm,
       baseUrl: llm.base_url,
       model: llm.model,
+      activePresetId: null,
+      llmEndpointPresets: mergeLlmEndpointPresetsFromApi(localPresets, llm.llm_endpoint_presets),
       timeoutSeconds: llm.timeout_seconds,
       maxRetries: llm.max_retries,
       temperature: llm.temperature,

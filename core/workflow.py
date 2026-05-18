@@ -112,6 +112,8 @@ class WorkflowConfig:
     guard_outbound_enabled: bool = False
     guard_max_rounds: int = 2
     guard_model: Optional[str] = None
+    # 工具成功后，若下一轮仅自然语言收束且未写终止标记，是否自动推导为 DONE。
+    infer_done_after_tool_reply: bool = True
     # 模型偶发只吐空白时，在单轮内额外重试 chat（不先写入 assistant）。
     empty_reply_max_retries: int = 2
 
@@ -137,6 +139,12 @@ class WorkflowConfig:
         gmr = int(os.getenv("WORKFLOW_GUARD_MAX_ROUNDS", "2"))
         gmr = max(1, min(gmr, 5))
         gmodel = os.getenv("WORKFLOW_GUARD_MODEL", "").strip() or None
+        infer_done = os.getenv("WORKFLOW_INFER_DONE_AFTER_TOOL_REPLY", "1").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         raw_empty = os.getenv("WORKFLOW_EMPTY_REPLY_MAX_RETRIES", "").strip()
         empty_retries = 2
         if raw_empty.isdigit():
@@ -152,6 +160,7 @@ class WorkflowConfig:
             guard_outbound_enabled=go,
             guard_max_rounds=gmr,
             guard_model=gmodel,
+            infer_done_after_tool_reply=infer_done,
             empty_reply_max_retries=empty_retries,
         )
 
@@ -214,8 +223,13 @@ class Workflow:
 
             try:
                 reply = self._think()
-                parsed = self._parse_reply(reply)
-                reply, parsed = self._maybe_preflight_guard(reply, parsed)
+                try:
+                    parsed = self._parse_reply(reply)
+                except CodeFormatError as exc:
+                    reply, parsed = self._maybe_preflight_guard(reply, None, parse_error=exc)
+                else:
+                    reply, parsed = self._maybe_preflight_guard(reply, parsed)
+                self._assert_no_orphan_file_blocks(parsed)
 
                 acted, tools_all_ok = self._maybe_act(parsed)
 
@@ -235,6 +249,8 @@ class Workflow:
                     return self._finalize_done(reply)
 
                 self._reflect(parsed, acted)
+                if self._state is AgentState.DONE:
+                    return self._finalize_done(reply)
 
             except RetryableError as exc:
                 self._handle_retryable(exc)
@@ -292,10 +308,15 @@ class Workflow:
                 "模型在空正文重试预算内持续返回空或仅空白内容",
                 details={"attempts": attempts, "last_usage": usage},
             )
-        parsed = parse_response(reply, mode=self._mode, require_block=False)
+        parse_error: Optional[CodeFormatError] = None
+        try:
+            parsed = parse_response(reply, mode=self._mode, require_block=False)
+        except CodeFormatError as exc:
+            parse_error = exc
+            parsed = ParsedOutput(raw_text=reply)
         self._trace.log(
             KIND_RESPONSE,
-            self._response_trace_payload(reply, parsed, usage),
+            self._response_trace_payload(reply, parsed, usage, parse_error=parse_error),
             state=self._state,
             turn=self._turn,
             context=self._context,
@@ -308,6 +329,7 @@ class Workflow:
         reply: str,
         parsed: ParsedOutput,
         usage: Dict[str, Any],
+        parse_error: Optional[CodeFormatError] = None,
     ) -> Dict[str, Any]:
         """写入轨迹的 response 载荷；附加上下文状态说明便于前端画布展示。"""
         payload: Dict[str, Any] = {
@@ -337,6 +359,9 @@ class Workflow:
                 f" completion_tokens={ct!r}。"
                 "常见原因：API 异常、仅空白/不可见 token、上游截断或模型异常短答。"
             )
+        if parse_error is not None:
+            payload["parse_error"] = str(parse_error)
+            payload["display_hint"] = "本轮 assistant 回复暂未通过结构化解析，正在尝试工具预检修复。"
         return payload
 
     def _parse_reply(self, reply: str) -> ParsedOutput:
@@ -346,6 +371,17 @@ class Workflow:
             return parse_response(reply, mode=self._mode, require_block=False)
         except CodeFormatError:
             raise
+
+    def _assert_no_orphan_file_blocks(self, parsed: ParsedOutput) -> None:
+        """拒绝只用旧式 ``<file>`` 块写文件，促使模型重试为 ``file_write`` 工具调用。"""
+        if parsed.files and not parsed.tool_calls:
+            paths = ", ".join(f.file_path for f in parsed.files)
+            raise RetryableError(
+                "检测到 assistant 使用了 <file> 标签但没有调用 file_write 工具。"
+                "请重新生成，并务必使用 "
+                "`<tool name=\"file_write\">{\"path\":\"...\",\"content\":\"...\"}</tool>` "
+                f"进行文件写入。涉及路径：{paths}",
+            )
 
     def _maybe_act(self, parsed: ParsedOutput) -> tuple[bool, bool]:
         """执行本轮解析出的工具调用。
@@ -714,12 +750,42 @@ class Workflow:
             logger.warning("出站 guard 使用 response_format=json_object 失败（%s），回退普通调用", exc)
             return self._llm.chat(payload, model=m, temperature=0.0, max_tokens=900)
 
-    def _maybe_preflight_guard(self, reply: str, parsed: ParsedOutput) -> Tuple[str, ParsedOutput]:
-        """工具执行前：独立模型会话尝试把 assistant 正文修到可解析且工具名合法。"""
-        if not self._config.guard_preflight_enabled or not parsed.tool_calls:
-            return reply, parsed
-
+    def _maybe_preflight_guard(
+        self,
+        reply: str,
+        parsed: Optional[ParsedOutput],
+        *,
+        parse_error: Optional[CodeFormatError] = None,
+    ) -> Tuple[str, ParsedOutput]:
+        """工具执行前：仅在解析失败或工具名未知时，用独立模型修复。"""
         allowed = {t.name for t in self._tools.list_specs()}
+        if parsed is not None:
+            unknown = [c.name for c in parsed.tool_calls if c.name not in allowed]
+            if not unknown:
+                return reply, parsed
+        else:
+            unknown = []
+
+        if not self._config.guard_preflight_enabled:
+            if parse_error is not None:
+                raise parse_error
+            raise CodeFormatError(f"assistant 产出未知工具：{unknown!r}")
+
+        reason = "parse_error" if parse_error is not None else "unknown_tool"
+        self._trace.log(
+            KIND_GUARD_PREFLIGHT,
+            {
+                "ok": None,
+                "status": "pending",
+                "reason": reason,
+                "unknown_tools": unknown,
+                "message": "正在工具预检：修复结构化格式或未知工具名。",
+            },
+            state=self._state,
+            turn=self._turn,
+            context=self._context,
+        )
+
         last_err: Optional[Exception] = None
         for attempt in range(1, self._config.guard_max_rounds + 1):
             user = build_preflight_user(
@@ -785,6 +851,8 @@ class Workflow:
         acted: bool,
     ) -> Tuple[bool, str, ParsedOutput]:
         """工具已成功、本轮为自然语言收束且无 ``[完成]``：启发式或出站模型决定是否直接 DONE。"""
+        if not self._config.infer_done_after_tool_reply:
+            return False, reply, parsed
         if acted or parsed.tool_calls:
             return False, reply, parsed
         if self._is_terminal_reply(reply, parsed):

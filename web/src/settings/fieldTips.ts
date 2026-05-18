@@ -10,6 +10,9 @@ export const SETTINGS_FIELD_TIPS = {
   llmBaseUrl: "OpenAI 兼容 API 根地址，例如本机 Ollama 的 http://host:11434/v1。",
   llmApiKey: "HTTP 鉴权用密钥；Ollama 本地常为 ollama。仅随 WebSocket 发给本机后端。",
   llmModel: "主对话与（未单独指定时）护栏、摘要共用的模型名。",
+  llmPresetSelect: "每条预设包含 base_url、model、api_key；选择后一次性填入下方三项。",
+  llmEndpointPresetsHint:
+    "环境变量 LLM_ENDPOINT_PRESETS（JSON 数组）在「从服务器同步」时与列表合并；同 base_url+model 时保留你在浏览器里已填的 API Key。HTTP 接口不返回密钥明文。",
   llmTimeout: "单次 chat 请求墙钟超时（秒），过大易占连接，过小易误杀长推理。",
   llmRetries: "超时或瞬态网络错误时的自动重试次数（不含首次）。",
   llmTemperature: "采样温度；代码任务宜偏低以提高格式稳定性。",

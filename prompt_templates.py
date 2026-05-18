@@ -76,8 +76,10 @@ _TOOL_JSON_RULES_CN = (
     "`<tool name=\"python_repl\"><![CDATA[{\"code\":\"import os\\\\nprint(1)\"}]]></tool>`。\n"
 )
 
-_FILE_BODY_RULES_CN = (
-    "- `<file path=\"...\">` 与 `</file>` 之间直接写源码，不要外层再套 Markdown ``` 围栏。\n"
+_FILE_WRITE_RULES_CN = (
+    "- 创建或修改文件时，必须调用 `file_write` 工具："
+    "`<tool name=\"file_write\">{\"path\":\"相对/路径.py\",\"content\":\"完整文件内容\"}</tool>`。\n"
+    "- 不要使用 `<file path=\"...\">...</file>` 标签；该标签只作为旧格式解析兼容，不会作为写入主路径。\n"
 )
 
 _DEV_COMPLETION_RULES_CN = (
@@ -93,11 +95,10 @@ _DEV_COMPLETION_RULES_CN = (
 _OUTPUT_RULES: Dict[TaskMode, str] = {
     TaskMode.DEVELOPMENT: (
         "输出规则：\n"
-        "- 源代码必须放在 `<file path=\"相对/路径.py\">...</file>` 标签内。\n"
         "- `path` 始终是相对于项目工作空间的相对路径，不允许绝对路径或 `..`。\n"
         "- 工具调用必须使用 `<tool name=\"<工具名>\">{JSON 参数}</tool>`。\n"
         f"{_TOOL_JSON_RULES_CN}"
-        f"{_FILE_BODY_RULES_CN}"
+        f"{_FILE_WRITE_RULES_CN}"
         f"{_DEV_COMPLETION_RULES_CN}"
         "- `<thought>...</thought>` 块可选；遇到非平凡推理时鼓励使用。"
     ),
@@ -105,10 +106,10 @@ _OUTPUT_RULES: Dict[TaskMode, str] = {
         "输出规则：\n"
         "- 每一轮响应都必须至少包含一个 `<thought>...</thought>` 块，"
         "用于展示你的推理链条。\n"
-        "- 实证脚本必须放在 `<file path=\"相对/路径.py\">...</file>` 标签内。\n"
+        "- 实证脚本必须通过 `file_write` 工具写入工作空间。\n"
         "- 工具调用必须使用 `<tool name=\"<工具名>\">{JSON 参数}</tool>`。\n"
         f"{_TOOL_JSON_RULES_CN}"
-        f"{_FILE_BODY_RULES_CN}"
+        f"{_FILE_WRITE_RULES_CN}"
         "- 把工具返回的数据视为证据；任何统计数字都不允许凭空编造。"
     ),
 }

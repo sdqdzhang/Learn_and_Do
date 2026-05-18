@@ -31,7 +31,7 @@ from server.start_payload import (
     resolve_intervention,
     summarizer_model_from_start,
 )
-from core.audit import TraceLogger
+from core.audit import KIND_FINAL_SUMMARY, TraceLogger
 from core.exceptions import FatalError
 from core.intervention import InterventionChannel
 from core.schema import AgentRole, TaskMode, TraceEvent
@@ -69,6 +69,48 @@ def _coerce_max_turns(raw: Any, fallback: int) -> int:
     except (TypeError, ValueError):
         return fallback
     return max(1, min(v, 500))
+
+
+def _build_final_summary(
+    *,
+    llm: LLMClient,
+    context: SessionContext,
+    prompt: str,
+    result_state: str,
+    turns: int,
+    last_message: Optional[str],
+    error: Optional[str],
+) -> str:
+    """用当前模型把本次会话压成一段给用户看的最终结果。"""
+    transcript_lines: list[str] = []
+    for m in context.messages()[-20:]:
+        content = (m.content or "").strip()
+        if len(content) > 1600:
+            content = content[:1600] + "..."
+        transcript_lines.append(f"[{m.role.value}]\n{content}")
+    system = (
+        "你是一个会话收尾总结器。请根据 agent 的执行轨迹，输出给最终用户看的中文结果。"
+        "要求：1) 先说明最终状态；2) 总结已经完成了什么；3) 如有文件、工具输出、失败原因或后续建议，"
+        "用简洁条目列出；4) 不要编造轨迹中没有的信息。"
+    )
+    user = (
+        f"用户原始任务：{prompt}\n"
+        f"最终状态：{result_state}\n"
+        f"轮数：{turns}\n"
+        f"错误：{error or '无'}\n"
+        f"最后一条 assistant 消息：\n{last_message or '无'}\n\n"
+        "最近上下文：\n"
+        + "\n\n".join(transcript_lines)
+    )
+    summary = llm.chat(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
+        max_tokens=900,
+    ).strip()
+    return summary or (last_message or error or "会话已结束，但模型未返回总结。")
 
 
 @app.get("/api/settings")
@@ -196,6 +238,32 @@ async def session_ws(websocket: WebSocket) -> None:
                 cancel_event=cancel_event,
             )
             result = workflow.run(prompt)
+            final_summary = ""
+            try:
+                final_summary = _build_final_summary(
+                    llm=llm,
+                    context=context,
+                    prompt=prompt,
+                    result_state=result.final_state.value,
+                    turns=result.turns,
+                    last_message=result.last_message,
+                    error=result.error,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("生成最终总结失败：%s", exc)
+                final_summary = result.last_message or result.error or "会话已结束，但最终总结生成失败。"
+            trace.log(
+                KIND_FINAL_SUMMARY,
+                {
+                    "summary": final_summary,
+                    "final_state": result.final_state.value,
+                    "turns": result.turns,
+                    "error": result.error,
+                },
+                state=result.final_state,
+                turn=result.turns,
+                context=context,
+            )
             push_line(
                 json.dumps(
                     {
@@ -205,6 +273,7 @@ async def session_ws(websocket: WebSocket) -> None:
                         "turns": result.turns,
                         "error": result.error,
                         "last_message": result.last_message,
+                        "final_summary": final_summary,
                     },
                     ensure_ascii=False,
                 )
@@ -256,6 +325,12 @@ async def session_ws(websocket: WebSocket) -> None:
             except WebSocketDisconnect:
                 cancel_event.set()
                 break
+            except RuntimeError as exc:
+                # 客户端已断开时，部分 ASGI 实现会抛 RuntimeError 而非 WebSocketDisconnect。
+                if "websocket.send" in str(exc) or "websocket.close" in str(exc):
+                    cancel_event.set()
+                    break
+                raise
     finally:
         recv_task.cancel()
         try:

@@ -1,9 +1,22 @@
 /** 与 WebSocket ``start`` 载荷及 ``GET /api/settings`` 对齐的 UI 状态。 */
 
+/** 一条 OpenAI 兼容端点（仅前端持久化 + 同步合并；start 仍用顶层 llm 三字段）。 */
+export type LlmEndpointPreset = {
+  id: string;
+  /** 下拉与列表中的显示名 */
+  label: string;
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+};
+
 export type LlmSettings = {
   baseUrl: string;
   apiKey: string;
   model: string;
+  /** 当前下拉选中的预设 id；空字符串表示未套用预设。 */
+  activePresetId: string | null;
+  llmEndpointPresets: LlmEndpointPreset[];
   timeoutSeconds: number;
   maxRetries: number;
   temperature: number;
@@ -62,6 +75,13 @@ export type ApiSettingsResponse = {
       base_url: string;
       api_key_display: string;
       model: string;
+      llm_endpoint_presets?: Array<{
+        id?: string | null;
+        label?: string | null;
+        base_url?: string | null;
+        model?: string | null;
+        api_key?: string | null;
+      }> | null;
       timeout_seconds: number;
       max_retries: number;
       temperature: number;

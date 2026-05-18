@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import replace
@@ -16,6 +17,42 @@ from runtime.executor import ExecutorConfig
 from utils.llm_client import LLMConfig
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _parse_llm_endpoint_presets_env(raw: Optional[str]) -> list[dict[str, Any]]:
+    """Parse ``LLM_ENDPOINT_PRESETS`` JSON array for the web settings UI.
+
+    Each object: ``label`` (optional), ``base_url`` / ``baseUrl``, ``model``, optional ``id``.
+    ``api_key`` is never included in the HTTP response (secrets stay in ``.env`` / browser only).
+    """
+    if not raw or not str(raw).strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            continue
+        base_url = str(item.get("base_url") or item.get("baseUrl") or "").strip()
+        model = str(item.get("model") or "").strip()
+        if not base_url or not model:
+            continue
+        label = str(item.get("label") or model).strip() or model
+        sid = str(item.get("id") or "").strip() or f"env-{i}"
+        out.append(
+            {
+                "id": sid,
+                "label": label,
+                "base_url": base_url,
+                "model": model,
+                "api_key": "",
+            }
+        )
+    return out
 
 
 def _truthy(v: Any) -> bool:
@@ -238,6 +275,7 @@ def public_server_defaults() -> Dict[str, Any]:
             "base_url": llm.base_url,
             "api_key_display": key_disp,
             "model": llm.model,
+            "llm_endpoint_presets": _parse_llm_endpoint_presets_env(os.getenv("LLM_ENDPOINT_PRESETS")),
             "timeout_seconds": llm.timeout_seconds,
             "max_retries": llm.max_retries,
             "temperature": llm.temperature,

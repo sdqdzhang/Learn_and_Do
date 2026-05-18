@@ -41,6 +41,7 @@ export default function App() {
   const nodes = useTraceStore((s) => s.nodes);
   const edges = useTraceStore((s) => s.edges);
   const selectedEvent = useTraceStore((s) => s.selectedEvent);
+  const finalSummary = useTraceStore((s) => s.finalSummary);
 
   const [prompt, setPrompt] = useState("");
   const [page, setPage] = useState<"trace" | "settings">("trace");
@@ -185,6 +186,10 @@ export default function App() {
       if (o.type === "done") {
         setSessionStatus("done");
         const fs = String(o.final_state ?? "");
+        const summary = typeof o.final_summary === "string" ? o.final_summary.trim() : "";
+        if (summary) {
+          useTraceStore.getState().setFinalSummary(summary);
+        }
         setStatusNote(`完成：${fs} · ${String(o.turns ?? "")} 轮`);
         void refreshTraceList();
         ws.close();
@@ -410,6 +415,13 @@ export default function App() {
             <pre className="max-h-[calc(100vh-10rem)] overflow-auto rounded border border-slate-800 bg-black/50 p-3 text-[11px] leading-relaxed text-slate-300">
               {JSON.stringify(selectedEvent, null, 2)}
             </pre>
+          ) : finalSummary ? (
+            <section className="max-h-[calc(100vh-10rem)] overflow-auto rounded border border-emerald-900/60 bg-emerald-950/20 p-3 text-xs leading-relaxed text-slate-200">
+              <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-emerald-300">
+                最终结果
+              </div>
+              <div className="whitespace-pre-wrap">{finalSummary}</div>
+            </section>
           ) : (
             <p className="text-xs leading-relaxed text-slate-500">
               点击画布节点查看 JSON。先启动后端：<code className="text-slate-400">uvicorn server.app:app --port 8765</code>
